@@ -1,4 +1,4 @@
-package testutil
+package loopbackport
 
 import (
 	"errors"
@@ -8,10 +8,10 @@ import (
 
 // A reserved port lies between reservedPortRangeStart and the floor of the
 // kernel's ephemeral range, which bind(":0") and outgoing connects draw from.
-func TestReserveLoopbackPortIsOutsideTheEphemeralRange(t *testing.T) {
-	port, err := ReserveLoopbackPort()
+func TestReserveIsOutsideTheEphemeralRange(t *testing.T) {
+	port, err := Reserve()
 	if err != nil {
-		t.Fatalf("ReserveLoopbackPort: %v", err)
+		t.Fatalf("Reserve: %v", err)
 	}
 	if lo := ephemeralPortRangeStart(); port < reservedPortRangeStart || port >= lo {
 		t.Fatalf("port %d outside [%d, %d)", port, reservedPortRangeStart, lo)
@@ -22,13 +22,13 @@ func TestReserveLoopbackPortIsOutsideTheEphemeralRange(t *testing.T) {
 // listen-then-close on ":0" gave two concurrent Bazel test actions on one
 // rbe-west worker the same supervisor port (ga-96smfk.45, ga-vnycm2.15): the
 // lease is netns-wide, so it holds across processes as well as within one.
-func TestReserveLoopbackPortNeverHandsOutALeasedPort(t *testing.T) {
+func TestReserveNeverHandsOutALeasedPort(t *testing.T) {
 	if !portLeasesEnforced {
 		t.Skip("port leases need a network-namespace-scoped name (Linux abstract sockets)")
 	}
 	seen := map[int]bool{}
 	for i := 0; i < 50; i++ {
-		port, err := ReserveLoopbackPort()
+		port, err := Reserve()
 		if err != nil {
 			t.Fatalf("reservation %d: %v", i, err)
 		}
@@ -41,16 +41,16 @@ func TestReserveLoopbackPortNeverHandsOutALeasedPort(t *testing.T) {
 
 // With a one-port range, the second reservation of that port fails instead of
 // returning a port another holder already leased.
-func TestReserveLoopbackPortInRefusesALeasedPort(t *testing.T) {
+func TestReserveInRefusesALeasedPort(t *testing.T) {
 	if !portLeasesEnforced {
 		t.Skip("port leases need a network-namespace-scoped name (Linux abstract sockets)")
 	}
-	port, err := ReserveLoopbackPort()
+	port, err := Reserve()
 	if err != nil {
-		t.Fatalf("ReserveLoopbackPort: %v", err)
+		t.Fatalf("Reserve: %v", err)
 	}
-	if got, err := reserveLoopbackPortIn(port, port); err == nil {
-		t.Fatalf("reserveLoopbackPortIn(%d, %d) = %d, want an error for a leased port", port, port, got)
+	if got, err := reserveIn(port, port); err == nil {
+		t.Fatalf("reserveIn(%d, %d) = %d, want an error for a leased port", port, port, got)
 	}
 }
 
@@ -58,7 +58,7 @@ func TestReserveLoopbackPortInRefusesALeasedPort(t *testing.T) {
 // lease is given back. A test binary killed by a Bazel timeout drops its lease
 // while the server child it started can still hold the port, so only the bind
 // probe keeps the next reservation off it.
-func TestReserveLoopbackPortSkipsABoundPort(t *testing.T) {
+func TestReserveSkipsABoundPort(t *testing.T) {
 	listen := listenLoopbackProbe
 	t.Cleanup(func() { listenLoopbackProbe = listen })
 	bound := 0
@@ -70,15 +70,15 @@ func TestReserveLoopbackPortSkipsABoundPort(t *testing.T) {
 		return listen(port)
 	}
 
-	port, err := ReserveLoopbackPort()
+	port, err := Reserve()
 	if err != nil {
-		t.Fatalf("ReserveLoopbackPort: %v", err)
+		t.Fatalf("Reserve: %v", err)
 	}
 	if bound == 0 {
-		t.Fatal("ReserveLoopbackPort never probed whether its port was bound")
+		t.Fatal("Reserve never probed whether its port was bound")
 	}
 	if port == bound {
-		t.Fatalf("ReserveLoopbackPort returned port %d, which the probe found bound", port)
+		t.Fatalf("Reserve returned port %d, which the probe found bound", port)
 	}
 	lease, ok, err := leasePort(bound)
 	if err != nil || !ok {
