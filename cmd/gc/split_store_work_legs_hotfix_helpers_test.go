@@ -12,18 +12,24 @@ import (
 // split-store work-leg tests use.
 
 // killRaceStore fails the Lists whose status listErr names, standing in for
-// a dark leg. Conditional writes resolve to the wrapped store, so releases keep
-// their CAS.
+// a dark leg, and lets a test watch the reads: afterList runs after every List
+// the wrapped store answers. Conditional writes resolve to the wrapped store,
+// so releases keep their CAS.
 type killRaceStore struct {
 	beads.Store
-	listErr map[string]error // by query status
+	afterList func(q beads.ListQuery, got []beads.Bead)
+	listErr   map[string]error // by query status
 }
 
 func (s *killRaceStore) List(q beads.ListQuery) ([]beads.Bead, error) {
 	if err := s.listErr[q.Status]; err != nil {
 		return nil, err
 	}
-	return s.Store.List(q)
+	got, err := s.Store.List(q)
+	if err == nil && s.afterList != nil {
+		s.afterList(q, got)
+	}
+	return got, err
 }
 
 func (s *killRaceStore) ConditionalWritesResolveTarget() beads.Store { return s.Store }
