@@ -585,6 +585,13 @@ func TestPaneShowsDrainedComposerRejectsMergedClaudeDraft(t *testing.T) {
 	if !paneShowsDrainedComposer(claudeEmptyAfterStopPane) {
 		t.Fatal("paneShowsDrainedComposer = false for an empty input box, want true")
 	}
+	// Provider-looking glyphs inside a framed draft are input, not a new composer.
+	for _, glyph := range []string{"› ", "❯ "} {
+		framed := []string{strings.Repeat("─", 80), "❯ retained draft", "  " + glyph, strings.Repeat("─", 80)}
+		if paneShowsDrainedComposer(framed) {
+			t.Fatalf("paneShowsDrainedComposer = true for framed input containing %q", glyph)
+		}
+	}
 	// A draft whose first row is blank still counts.
 	multiline := append(append([]string(nil), claudeRestoredDraftPane[:4]...), "❯ ", "  second row", strings.Repeat("─", 80))
 	if paneShowsDrainedComposer(multiline) {

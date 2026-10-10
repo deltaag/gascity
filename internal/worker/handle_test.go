@@ -110,7 +110,7 @@ func TestSessionHandleStateBusyDoesNotPrimeHistoryCache(t *testing.T) {
 	workDir := t.TempDir()
 	store := beads.NewMemStore()
 	sp := runtime.NewFake()
-	manager := sessionpkg.NewManagerWithOptions(store, sp)
+	manager := sessionpkg.NewManagerWithOptions(store, sp, sessionpkg.WithCityPath(t.TempDir()))
 	handle, err := NewSessionHandle(SessionHandleConfig{
 		Manager:     manager,
 		SearchPaths: []string{searchBase},
@@ -183,6 +183,7 @@ func TestSessionHandleStateReusesDerivedActivityAcrossPolls(t *testing.T) {
 	requestFactory := func() *Factory {
 		t.Helper()
 		factory, err := NewFactory(FactoryConfig{
+			CityPath:     t.TempDir(),
 			Store:        store,
 			Provider:     sp,
 			SearchPaths:  []string{searchBase},
@@ -1334,6 +1335,7 @@ func TestRuntimeHandleUsesWorkerBoundaryForLegacyRuntimeSession(t *testing.T) {
 	})
 
 	handle, err := NewRuntimeHandle(RuntimeHandleConfig{
+		CityPath:     t.TempDir(),
 		Provider:     sp,
 		SessionName:  "legacy-worker",
 		ProviderName: "stub",
@@ -1420,6 +1422,7 @@ func TestRuntimeHandleCloseDetailedStopsRuntimeAndReturnsZeroResult(t *testing.T
 		t.Fatalf("Start: %v", err)
 	}
 	handle, err := NewRuntimeHandle(RuntimeHandleConfig{
+		CityPath:     t.TempDir(),
 		Provider:     sp,
 		SessionName:  "legacy-worker",
 		ProviderName: "stub",
@@ -1477,6 +1480,7 @@ func TestRuntimeHandleTeardownAbsorbsOnlySessionGone(t *testing.T) {
 				}
 				sp.StopErrors["legacy-worker"] = stop.stopErr
 				handle, err := NewRuntimeHandle(RuntimeHandleConfig{
+					CityPath:     t.TempDir(),
 					Provider:     sp,
 					SessionName:  "legacy-worker",
 					ProviderName: "stub",
@@ -1756,6 +1760,7 @@ func TestRuntimeHandleStartResolvedStartsLegacyRuntimeSession(t *testing.T) {
 	sp := runtime.NewFake()
 
 	handle, err := NewRuntimeHandle(RuntimeHandleConfig{
+		CityPath:     t.TempDir(),
 		Provider:     sp,
 		SessionName:  "legacy-worker",
 		ProviderName: "stub",
@@ -2438,7 +2443,7 @@ func TestSessionHandleStartUsesSessionIDOnFirstStartAndResumeAfterSuspend(t *tes
 func TestSessionHandleStartUsesCurrentResumeOverridesAfterSuspend(t *testing.T) {
 	store := beads.NewMemStore()
 	sp := runtime.NewFake()
-	manager := sessionpkg.NewManagerWithOptions(store, sp)
+	manager := sessionpkg.NewManagerWithOptions(store, sp, sessionpkg.WithCityPath(t.TempDir()))
 
 	info, err := manager.CreateSession(
 		context.Background(), sessionpkg.CreateOptions{Template: "probe", Title: "Probe", Command: "legacy-agent", WorkDir: t.TempDir(), Provider: "legacy-agent", Env: nil, Resume: sessionpkg.ProviderResume{
@@ -2512,7 +2517,7 @@ func newTestSessionHandleWithRecorder(t *testing.T, spec SessionSpec, recorder e
 
 	store := beads.NewMemStore()
 	sp := runtime.NewFake()
-	manager := sessionpkg.NewManagerWithOptions(store, sp)
+	manager := sessionpkg.NewManagerWithOptions(store, sp, sessionpkg.WithCityPath(t.TempDir()))
 	handle, err := NewSessionHandle(SessionHandleConfig{
 		Manager:  manager,
 		Recorder: recorder,

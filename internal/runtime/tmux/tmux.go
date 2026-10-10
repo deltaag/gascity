@@ -2549,11 +2549,12 @@ func submitEnterAndConfirm(sendSubmit func() error, wake func(), busy func() (bo
 }
 
 // Staged-draft recovery bounds. The confirm window above totals ~2.4s, and a
-// codex TUI under load can take longer than that to ingest a large pasted
-// prompt (an ~11KB startup nudge). Every submit in the window then lands inside
-// the ingest and is swallowed, and the paste stays staged in the composer as
-// "[Pasted Content N chars]" with the seat idle and its claim held. Recovery
-// re-sends at a slower pace while that draft is visible, up to this bound.
+// staged-draft TUI (codex, Claude) under load can take longer than that to
+// ingest a large pasted prompt, such as codex's ~11KB startup nudge. Every
+// submit in the window then lands inside the ingest and is swallowed, and the
+// paste stays staged in the composer as its placeholder (stagedDraftMarkers)
+// with the seat idle and its claim held. Recovery re-sends at a slower pace
+// while that draft is visible, up to this bound.
 const (
 	submitDraftRecoverySends   = 8
 	submitDraftRecoveryBackoff = time.Second
@@ -2569,12 +2570,15 @@ type stagedDraftMarker struct {
 }
 
 // stagedDraftMarkers lists the families whose staged-paste placeholder is
-// known. codex collapses a large paste into "[Pasted Content N chars]" until
-// it is submitted. A family without an entry never gets recovery submits.
-// Every entry must also be submit-verify eligible: recovery runs only on the
-// verified submit path.
+// known. codex collapses a large paste into "[Pasted Content N chars]" and
+// Claude into "[Pasted text #N +M lines]" until it is submitted. A family
+// without an entry never gets recovery submits. Every entry must also be
+// submit-verify eligible: recovery runs only on the verified submit path.
+// paneShowsDrainedComposer reads every entry too: a composer that still shows
+// a placeholder has not drained.
 var stagedDraftMarkers = map[string]stagedDraftMarker{
-	"codex": {promptPrefix: "› ", marker: "[Pasted Content "},
+	"claude": {promptPrefix: "❯ ", marker: "[Pasted text #"},
+	"codex":  {promptPrefix: "› ", marker: "[Pasted Content "},
 }
 
 func stagedDraftMarkerForFamily(family string) (stagedDraftMarker, bool) {
@@ -4898,30 +4902,43 @@ func paneContainsBusyIndicator(lines []string) bool {
 	return false
 }
 
-// paneShowsDrainedComposer reports whether the pane's live composer -- the
-// LAST captured line matching the ready prompt prefix (DefaultReadyPromptPrefix)
-// -- has drained, meaning the submit Enter actually reached the pane and the
-// agent consumed it. Earlier lines that also start with the prompt prefix are
-// scrollback transcript entries, not the live composer, and are ignored.
-//
-// It returns true only when the composer is bare: the prior submit drained it
-// and only the busy-state OBSERVATION failed. Any text left in the composer
-// means the submit is in doubt, and callers must keep treating it as
-// unconfirmed and retry. That covers the sent message sitting
-// drafted-but-unsubmitted (ga-bwm), and a merged draft that starts with
-// something else: when Claude restores an interrupted prompt and the message
-// is pasted behind it, the composer starts with the OLD prompt, so looking for
-// the sent text there reported an unsent draft as delivered. Where Claude
-// Code's framed input box is on screen, its wrapped rows count too. Dim text
-// (Claude's placeholder) must already be removed (see captureInputLines).
-// When no line matches the prompt prefix at all, the composer cannot be
-// observed, so this conservatively returns false rather than claiming
-// delivery is proven.
+// paneShowsDrainedComposer reports whether the last visible composer is bare.
+// A staged-paste placeholder, restored draft, or wrapped input keeps delivery
+// unconfirmed even when it differs from the sent message. Prompt lines and
+// placeholders above the last known-family prompt belong to the transcript.
+// Dim placeholder text must already be removed (see captureInputLines).
 func paneShowsDrainedComposer(lines []string) bool {
-	if in, ok := readClaudeInput(lines); ok {
-		return in.empty()
+	live := -1
+	prefix := ""
+	for i, line := range lines {
+		for _, marker := range stagedDraftMarkers {
+			if matchesPromptPrefix(line, marker.promptPrefix) {
+				live, prefix = i, marker.promptPrefix
+			}
+		}
 	}
-	remainder, observed := lastComposerRemainder(lines, DefaultReadyPromptPrefix)
+	if live < 0 {
+		return false
+	}
+	for _, line := range lines[live:] {
+		for _, marker := range stagedDraftMarkers {
+			if strings.Contains(line, marker.marker) {
+				return false
+			}
+		}
+	}
+	// A provider-looking prompt on a wrapped row is still part of Claude's
+	// framed draft. Keep the surrounding input box when locating its start.
+	frameStart := live
+	for frameStart > 0 && !isDialogRule(lines[frameStart-1]) {
+		frameStart--
+	}
+	if frameStart > 0 {
+		if in, ok := readClaudeInput(lines[frameStart-1:]); ok {
+			return in.empty()
+		}
+	}
+	remainder, observed := lastComposerRemainder(lines[live:live+1], prefix)
 	return observed && strings.TrimSpace(remainder) == ""
 }
 
