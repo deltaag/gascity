@@ -98,7 +98,7 @@ func TestSplitStoreCascade_DrainFinalizeReleasesTheOwnDrainStep(t *testing.T) {
 
 // A close inside a tick runs its cascade off the tick's index: on either
 // shape, every store is listed once per status by the index and never again by
-// the cascade, and no list keyed by an assignee is made. hotfix/1.5.1: main
+// the cascade, and the work store is never listed per identity. hotfix/1.5.1: main
 // drives this through B1's killed-seat pool-slot close (#7362, not on hotfix);
 // here the close is the drain-finalize close with the tick's index installed,
 // whose cascade releases the seat's own drain step. hotfix's ReleaseWorkBead
@@ -137,7 +137,11 @@ func TestSplitStoreCascade_CloseInATickReadsOnlyTheTickIndex(t *testing.T) {
 					defer mu.Unlock()
 					switch {
 					case q.Assignee != "" || len(q.Assignees) > 0:
-						perIdentity = append(perIdentity, q)
+						// The close-time re-read lists the local binding per
+						// identity; the work store never is.
+						if s == work {
+							perIdentity = append(perIdentity, q)
+						}
 					case q.Live && q.TierMode == beads.TierBoth && q.Type == "" && q.Label == "" && len(q.IDs) == 0:
 						legLists[legStatus{s, q.Status}]++
 					}
