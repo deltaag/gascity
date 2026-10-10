@@ -1274,6 +1274,11 @@ func (cr *CityRuntime) tick(
 
 	// Session-management phases: snapshot, corpse sweeps, drain finalization,
 	// demand/desired state, bead-driven reconcile.
+	//
+	// The session phases share one seat work index per tick (seat_work.go),
+	// installed here, after the config reload, so it reads this tick's legs.
+	// The reconcile pass finds it installed and keeps it.
+	defer installSeatWorkIndex(cr.cityPath, cr.cfg, cr.sessionsBeadStore().Store, cr.rigBeadStores())() // residency:allow — handed to assignedWorkSweepPlan, which plans the legs
 	phaseStart = time.Now()
 	sessionBeads := cr.loadSessionBeadSnapshot()
 	recordPhase(TraceSiteSessionSnapshot, "load_session_snapshot.initial", phaseStart, traceSessionSnapshotFields(sessionBeads))
