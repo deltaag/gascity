@@ -1256,7 +1256,7 @@ func operatorTimeline() []timelineFixture {
 	// wait_hold. When the wait's dependency closes, legacy wakes it through
 	// the idle latch: the wait's own intent is no explicit sleep intent
 	// (explicitSleepIntentInfo), so its claim is not stranded.
-	waitDrained := tlMerged(tlIdent(), drainedRow, map[string]string{"runtime:s-gc-1": "A20 drain-begin", "row:gc-1:state": "A20 drain-begin", "row:gc-1:*stranded": "A21 stranded", "row:gc-1:detached_at": "A20 wait-sleep"})
+	waitDrained := tlMerged(tlIdent(), drainedRow, map[string]string{"runtime:s-gc-1": "A20 drain-begin", "row:gc-1:state": "A20 drain-begin", "row:gc-1:*stranded": "A20 wait-sleep", "row:gc-1:detached_at": "A20 wait-sleep"})
 	napping := func() *config.City {
 		cfg := tlCity()
 		cfg.Agents[0].SleepAfterIdle = "5m"
@@ -1294,7 +1294,7 @@ func operatorTimeline() []timelineFixture {
 				"provider:SetMeta s-gc-1": "A20 drain-begin", "provider:RemoveMeta s-gc-1": "A20 drain-begin", "provider:Stop s-gc-1": "A20 drain-begin",
 				`event:session.drain_acked_with_assigned_work worker {"bead_id":"gw-1","bead_status":"in_progress","reason":"drain_acked_with_assigned_work","session_id":"gc-1","template":"worker"}`: "A20 drain-begin",
 				`event:session.stopped worker {"reason":"drain acknowledged","session_id":"gc-1","template":"worker"}`:                                                                                 "A20 drain-begin",
-				`event:session.stranded gc-1 {"session_id":"gc-1","session_name":"s-gc-1","template":"worker","work_bead_ids":["gw-1"]}`:                                                               "A21 stranded",
+				`event:session.stranded gc-1 {"session_id":"gc-1","session_name":"s-gc-1","template":"worker","work_bead_ids":["gw-1"]}`:                                                               "A20 wait-sleep",
 			}),
 			"the wait turns ready": tlMerged(tlIdent(), map[string]string{
 				"row:gc-1:*waitsleep": "A20 wait-sleep", "runtime:s-gc-1": "A20 wait-sleep", "provider:Start s-gc-1": "A20 wait-sleep", "provider:RemoveMeta s-gc-1": "A20 wait-sleep",
