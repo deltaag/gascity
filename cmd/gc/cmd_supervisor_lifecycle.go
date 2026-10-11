@@ -3,8 +3,6 @@ package main
 import (
 	"bufio"
 	"bytes"
-	"crypto/sha1"
-	"encoding/hex"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -26,6 +24,7 @@ import (
 
 	"github.com/gastownhall/gascity/internal/citylayout"
 	"github.com/gastownhall/gascity/internal/execenv"
+	"github.com/gastownhall/gascity/internal/pathutil"
 	"github.com/gastownhall/gascity/internal/processenv"
 	"github.com/gastownhall/gascity/internal/processgroup"
 	"github.com/gastownhall/gascity/internal/searchpath"
@@ -561,7 +560,7 @@ func doSupervisorStartJSON(stdout, stderr io.Writer, jsonOut bool) int {
 	if delegated {
 		return delegatedSupervisorStart(delegation, stdout, stderr, jsonOut)
 	}
-	if msg, blocked := platformSupervisorHomeOverrideError(); blocked {
+	if msg, blocked := bareSupervisorHomeOverrideError(); blocked {
 		fmt.Fprintf(stderr, "gc supervisor start: %s\n", msg) //nolint:errcheck // best-effort stderr
 		return 1
 	}
@@ -581,6 +580,12 @@ func doSupervisorStartJSON(stdout, stderr io.Writer, jsonOut bool) int {
 	if err != nil {
 		fmt.Fprintf(stderr, "gc supervisor start: finding executable: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
+	}
+
+	if supervisorRuntimeGOOS == "darwin" {
+		if handled, code := startSupervisorViaInstalledLaunchd(supervisorStartLaunchdPlistPath(), gcPath, stdout, stderr, jsonOut); handled {
+			return code
+		}
 	}
 
 	logPath := supervisorLogPath()
@@ -611,9 +616,66 @@ func doSupervisorStartJSON(stdout, stderr io.Writer, jsonOut bool) int {
 		fmt.Fprintf(stderr, "gc supervisor start: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
+	exited := make(chan error, 1)
+	go func() { exited <- child.Wait() }()
+	return waitForStartedSupervisor(stdout, stderr, jsonOut, "see "+logPath, exited)
+}
 
-	deadline := time.Now().Add(supervisorReadyTimeout)
-	for time.Now().Before(deadline) {
+// supervisorStartLaunchdPlistPath locates the installed launchd plist for
+// gc supervisor start. Overridable for tests.
+var supervisorStartLaunchdPlistPath = supervisorLaunchdPlistPath
+
+// startSupervisorViaInstalledLaunchd starts the installed launchd job
+// instead of forking a detached supervisor (#6966). A forked supervisor runs
+// outside launchd's KeepAlive and inherits the caller's whole shell
+// environment rather than the plist's filtered EnvironmentVariables, so
+// provider credentials the operator kept out of the service would reach
+// every agent session.
+//
+// It returns handled=false, and the caller forks this gc as before, when no
+// plist is installed; when the plist launches a different (or unparseable)
+// gc binary than gcPath, since starting that job would run another gc
+// installation; and when launchctl cannot start the job (no GUI session over
+// SSH or in CI), matching ensureSupervisorRunning's fork fallback. Each
+// fallback except the first prints a warning naming the fix.
+func startSupervisorViaInstalledLaunchd(plistPath, gcPath string, stdout, stderr io.Writer, jsonOut bool) (handled bool, code int) {
+	content, err := os.ReadFile(plistPath)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			fmt.Fprintf(stderr, "gc supervisor start: warning: reading launchd plist %s: %v; starting the supervisor outside launchd\n", plistPath, err) //nolint:errcheck // best-effort stderr
+		}
+		return false, 0
+	}
+	label := supervisorLaunchdLabel()
+	plistBinary := supervisorLaunchdPlistGCPath(string(content))
+	if plistBinary == "" {
+		plistBinary = "(unreadable ProgramArguments)"
+	}
+	if !supervisorSameBinary(plistBinary, gcPath) {
+		fmt.Fprintf(stderr, "gc supervisor start: warning: launchd service %q runs %s, not this gc (%s); starting this gc outside launchd. Run '%s supervisor install --force' to make the service run this gc.\n", label, plistBinary, gcPath, shellQuotePath(gcPath)) //nolint:errcheck // best-effort stderr
+		return false, 0
+	}
+	// The supervisor is not running (checked by the caller), so a loaded
+	// but stopped job can be unloaded safely before a clean load+kickstart.
+	_ = supervisorLaunchctlRun("unload", plistPath)
+	if err := loadAndStartSupervisorLaunchd(plistPath, label); err != nil {
+		fmt.Fprintf(stderr, "gc supervisor start: warning: could not start launchd service %q (%v); starting the supervisor outside launchd instead. It will not be restarted by launchd and inherits this shell's environment, including provider credentials unless %s=1 is set.\n", label, err, supervisorOmitProviderCredsEnv) //nolint:errcheck // best-effort stderr
+		return false, 0
+	}
+	return true, waitForStartedSupervisor(stdout, stderr, jsonOut, "check 'launchctl print "+supervisorLaunchdServiceTarget(label)+"' and "+supervisorLogPath(), nil)
+}
+
+// waitForStartedSupervisor waits for a just-started supervisor to answer on
+// its control socket and reports the result. failureHint tells the operator
+// where to look when it never becomes ready. exited, when non-nil, delivers
+// the forked supervisor's exit: a supervisor that exits during startup (its
+// API port in use, a config error) fails the start at once with the exit and
+// the tail of supervisor.log, rather than after supervisorReadyTimeout spent
+// polling the socket of a process that is gone.
+func waitForStartedSupervisor(stdout, stderr io.Writer, jsonOut bool, failureHint string, exited <-chan error) int {
+	deadline := time.NewTimer(supervisorReadyTimeout)
+	defer deadline.Stop()
+	for {
 		if pid := supervisorAliveHook(); pid != 0 {
 			if jsonOut {
 				return writeLifecycleActionJSONOrExit(stdout, stderr, "gc supervisor start", lifecycleActionJSON{
@@ -627,11 +689,73 @@ func doSupervisorStartJSON(stdout, stderr io.Writer, jsonOut bool) int {
 			printDashboardStartHint(stdout)
 			return 0
 		}
-		time.Sleep(supervisorReadyPollInterval)
+		select {
+		case err := <-exited:
+			if supervisorInstanceLockHeld() {
+				// Another instance holds the single-instance lock — a
+				// concurrent start won the race and this child stood down.
+				// Its readiness is what this start waits for now.
+				exited = nil
+				continue
+			}
+			status := "exit status 0"
+			if err != nil {
+				status = err.Error()
+			}
+			fmt.Fprintf(stderr, "gc supervisor start: supervisor exited before it became ready (%s); %s\n", status, failureHint) //nolint:errcheck // best-effort stderr
+			if tail := supervisorLogTail(supervisorLogPath(), supervisorStartFailureLogLines); tail != "" {
+				fmt.Fprintf(stderr, "last lines of %s:\n%s", supervisorLogPath(), tail) //nolint:errcheck // best-effort stderr
+			}
+			return 1
+		case <-deadline.C:
+			fmt.Fprintf(stderr, "gc supervisor start: supervisor did not become ready; %s\n", failureHint) //nolint:errcheck // best-effort stderr
+			return 1
+		case <-time.After(supervisorReadyPollInterval):
+		}
 	}
+}
 
-	fmt.Fprintf(stderr, "gc supervisor start: supervisor did not become ready; see %s\n", logPath) //nolint:errcheck // best-effort stderr
-	return 1
+// supervisorInstanceLockHeld reports whether some supervisor instance holds
+// the single-instance lock. A variable so tests can model a concurrent start.
+var supervisorInstanceLockHeld = func() bool {
+	lock, err := acquireSupervisorLock()
+	if err != nil {
+		return true
+	}
+	lock.Close() //nolint:errcheck // release probe lock
+	return false
+}
+
+// supervisorStartFailureLogLines is how much of supervisor.log a failed start
+// echoes: the startup lines of the instance that just exited.
+const supervisorStartFailureLogLines = 20
+
+// supervisorLogTailBytes bounds how much of the log supervisorLogTail reads.
+const supervisorLogTailBytes = 64 << 10
+
+// supervisorLogTail returns the last n lines of the log at path, each ending
+// in a newline, or "" when it cannot be read. It reads at most the last
+// supervisorLogTailBytes of the file.
+func supervisorLogTail(path string, n int) string {
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close() //nolint:errcheck // read-only
+	if info, err := f.Stat(); err == nil && info.Size() > supervisorLogTailBytes {
+		if _, err := f.Seek(-supervisorLogTailBytes, io.SeekEnd); err != nil {
+			return ""
+		}
+	}
+	data, err := io.ReadAll(io.LimitReader(f, supervisorLogTailBytes))
+	if err != nil || len(data) == 0 {
+		return ""
+	}
+	lines := strings.SplitAfter(strings.TrimRight(string(data), "\n"), "\n")
+	if len(lines) > n {
+		lines = lines[len(lines)-n:]
+	}
+	return strings.Join(lines, "") + "\n"
 }
 
 // supervisorForkEnv derives the environment for a forked `gc supervisor run`
@@ -643,6 +767,10 @@ func doSupervisorStartJSON(stdout, stderr io.Writer, jsonOut bool) int {
 // runtime (ga-s434i0) — a bare `gc supervisor run` with no session of its own
 // then becomes a kill target the next time that session bead pre-starts.
 //
+// With GC_SUPERVISOR_OMIT_PROVIDER_CREDS=1 in the parent environment the
+// child also drops every provider-credential variable, the same opt-out the
+// launchd plist and systemd unit honor (#6966).
+//
 // The child DOES carry supervisorPreserveSessionsOnSignalEnv=1 (added if
 // absent, replaced in place if already present with a different value) so
 // that if this process later ends up running under the systemd unit, a
@@ -651,8 +779,17 @@ func doSupervisorStartJSON(stdout, stderr io.Writer, jsonOut bool) int {
 func supervisorForkEnv(parent []string) []string {
 	env := make([]string, 0, len(parent)+1)
 	preserveSet := false
+	omitProviderCreds := false
+	for _, kv := range parent {
+		if kv == supervisorOmitProviderCredsEnv+"=1" {
+			omitProviderCreds = true
+		}
+	}
 	for _, kv := range parent {
 		if strings.HasPrefix(kv, "GC_SESSION_ID=") {
+			continue
+		}
+		if key, _, ok := strings.Cut(kv, "="); ok && omitProviderCreds && isProviderCredentialEnv(key) {
 			continue
 		}
 		if strings.HasPrefix(kv, supervisorPreserveSessionsOnSignalEnv+"=") {
@@ -762,8 +899,16 @@ func ensureSupervisorRunning(stdout, stderr io.Writer) int {
 		return 1
 	}
 	if msg, blocked := platformSupervisorHomeOverrideError(); blocked {
-		fmt.Fprintf(stderr, "gc supervisor start: %s\n", msg) //nolint:errcheck // best-effort stderr
-		return 1
+		if !supervisorIsolatedHome() {
+			fmt.Fprintf(stderr, "gc supervisor start: %s\n", msg) //nolint:errcheck // best-effort stderr
+			return 1
+		}
+		// An isolated run gets a bare supervisor: a platform unit would
+		// run under the real HOME, not the one this run isolates.
+		if supervisorAliveHook() != 0 {
+			return 0
+		}
+		return doSupervisorStart(stdout, stderr)
 	}
 	// Always regenerate the service file so upgrades pick up template
 	// changes (e.g. PATH captured from the user's shell).
@@ -798,6 +943,44 @@ func platformSupervisorHomeOverrideError() (string, bool) {
 		return "", false
 	}
 	return fmt.Sprintf("HOME override %q differs from the user home %q; platform supervisor requires the real HOME. Keep HOME unchanged and use GC_HOME for isolated runs", envHome, lookup.HomeDir), true
+}
+
+// supervisorIsolatedHomeEnv marks a run whose HOME is a deliberate throwaway
+// (a test harness that must not read the operator's home) beside an explicit
+// GC_HOME. Such a run may bare-start a supervisor under the overridden HOME;
+// it still never installs a platform service unit.
+const supervisorIsolatedHomeEnv = "GC_SUPERVISOR_ISOLATED_HOME"
+
+// supervisorIsolatedHome reports whether this run opted into a bare
+// supervisor under an overridden HOME: GC_SUPERVISOR_ISOLATED_HOME=1 with an
+// explicit GC_HOME holding the supervisor's state. A GC_HOME naming the
+// operator's default ~/.gc does not qualify: under the overridden HOME gc
+// would put its lock and socket there instead of $XDG_RUNTIME_DIR/gc, miss the
+// operator's running supervisor, and start a second one over the same
+// registry.
+func supervisorIsolatedHome() bool {
+	if os.Getenv(supervisorIsolatedHomeEnv) != "1" {
+		return false
+	}
+	gcHome := strings.TrimSpace(os.Getenv("GC_HOME"))
+	if gcHome == "" {
+		return false
+	}
+	lookup, err := osuser.LookupId(strconv.Itoa(os.Getuid()))
+	if err != nil || strings.TrimSpace(lookup.HomeDir) == "" {
+		return false
+	}
+	return pathutil.NormalizePathForCompare(gcHome) != pathutil.NormalizePathForCompare(filepath.Join(lookup.HomeDir, ".gc"))
+}
+
+// bareSupervisorHomeOverrideError is platformSupervisorHomeOverrideError for a
+// bare (non-platform) supervisor start, which an isolated run may perform.
+func bareSupervisorHomeOverrideError() (string, bool) {
+	msg, blocked := platformSupervisorHomeOverrideError()
+	if blocked && supervisorIsolatedHome() {
+		return "", false
+	}
+	return msg, blocked
 }
 
 // supervisorSystemdExecStartBinary returns the gc binary path embedded in the
@@ -1332,18 +1515,32 @@ func stableSupervisorBinaryGopath(homeDir string) string {
 }
 
 func sanitizeServiceName(name string) string {
-	name = strings.ToLower(name)
-	re := regexp.MustCompile(`[^a-z0-9]+`)
-	name = re.ReplaceAllString(name, "-")
-	return strings.Trim(name, "-")
+	return supervisor.SanitizeServiceName(name)
 }
 
 var supervisorServiceEnvNameRE = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
 // Keep persistent service-file env narrow. Provider credentials and user
 // context need to survive launchd/systemd startup; arbitrary shell state can
-// be opted in with GC_SUPERVISOR_ENV.
+// be opted in with GC_SUPERVISOR_ENV. That same opt-in list is also read by
+// passthroughEnv (cmd_start.go) to decide which non-GC_-prefixed vars reach
+// every spawned agent session — one list, not two that have to be kept in
+// sync by hand.
 var supervisorServiceEnvKeys = map[string]bool{
+	// beads' pooled per-I/O deadline overrides (#1861 rationale, like the
+	// GC_DOLT_* keys). The supervisor's in-process store opens honor ONLY the
+	// env rung — the config.yaml rung reads a viper only cmd/bd initializes,
+	// .beads/.env is bd-main-only — so on a shared/hub-bound Dolt store where
+	// the 10s default is too tight these must survive plist regeneration.
+	// Scope: two opens withhold the BEADS_ namespace by design and keep the
+	// defaults either way — the storebinding workspace open, and the opt-in
+	// proxied-native read lane (GC_BEADS_PROXIED_NATIVE), whose own knob
+	// GC_BEADS_PROXIED_READ_BUDGET is a wall-clock cap on a whole read's
+	// retry chain, not a per-I/O deadline. Keep these keys out of
+	// nativeDoltOpenEnvKeys: that projection unsets a listed key whenever
+	// the open's env map omits it, as it omits these.
+	"BEADS_DOLT_POOL_READ_TIMEOUT":             true,
+	"BEADS_DOLT_POOL_WRITE_TIMEOUT":            true,
 	"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": true,
 	"CLAUDE_CODE_EFFORT_LEVEL":                 true,
 	"CLAUDE_CODE_OAUTH_TOKEN":                  true,
@@ -1537,14 +1734,7 @@ func supervisorServiceSuffix() string {
 	if !supervisor.UsesIsolatedGCHomeOverride() {
 		return ""
 	}
-	gcHome := isolatedSupervisorHome()
-	base := sanitizeServiceName(filepath.Base(gcHome))
-	sum := sha1.Sum([]byte(gcHome))
-	hash := hex.EncodeToString(sum[:])[:8]
-	if base == "" {
-		return "isolated-" + hash
-	}
-	return base + "-" + hash
+	return supervisor.ServiceSuffix(isolatedSupervisorHome())
 }
 
 func supervisorLaunchdLabel() string {

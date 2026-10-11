@@ -257,6 +257,13 @@ func startBeadsLifecycle(cityPath, _ string, cfg *config.City, stderr io.Writer)
 	}
 	if cityProviderOwned {
 		if cityState.State == providerScopeReady {
+			// The provider script pins a ready scope out of bd's shared-server
+			// mode by reading this pin, so it has to be in place before the
+			// start op runs bd (a city initialized by a build that did not
+			// write it is repaired here).
+			if err := ensureGCOwnedProxiedScopeSharedServerOff(cityPath, cityPath); err != nil {
+				return err
+			}
 			if err := ensureBeadsProvider(cityPath); err != nil {
 				return fmt.Errorf("provider-owned bead store: %w", err)
 			}
@@ -274,8 +281,14 @@ func startBeadsLifecycle(cityPath, _ string, cfg *config.City, stderr io.Writer)
 	if err := initAndHookDir(cityPath, cityPath, beadsPrefix); err != nil {
 		return fmt.Errorf("init city beads: %w", err)
 	}
+	suspended := suspendedBeadsScopes(cityPath, cfg)
 	for i := range cfg.Rigs {
 		if strings.TrimSpace(cfg.Rigs[i].Path) == "" {
+			continue
+		}
+		if suspended.Suspended(cfg.Rigs[i].Path) && providerOwnedScopeReady(cityPath, cfg.Rigs[i].Path) {
+			// A suspended rig whose store already exists is left cold: its
+			// readiness ping would restart its proxy and Dolt.
 			continue
 		}
 		prefix := cfg.Rigs[i].EffectivePrefix()
@@ -711,7 +724,9 @@ func ensureCanonicalScopeConfigState(fs fsys.FS, dir string, state contract.Conf
 	if err != nil {
 		return err
 	}
-	if changed && state.EndpointOrigin != contract.EndpointOriginExplicit {
+	autoExport, autoExportSet, autoExportErr := contract.ReadExportAuto(fs, filepath.Join(beadsDir, "config.yaml"))
+	if changed && state.EndpointOrigin != contract.EndpointOriginExplicit &&
+		autoExportErr == nil && (!autoExportSet || !autoExport) {
 		// PR 1965 made export.auto:false canonical, but a pre-existing
 		// .beads/issues.jsonl from before this normalization still triggers
 		// bd's auto-import-on-write trap (sa-41j3kp) — bd sees the file,
@@ -719,16 +734,20 @@ func ensureCanonicalScopeConfigState(fs fsys.FS, dir string, state contract.Conf
 		// subprocess timeout while it re-imports the JSONL. The file is a
 		// stale export from when auto-export was on; with the canonical
 		// config now suppressing auto-export, nothing will refresh it. Explicit
-		// opt-out scopes keep JSONL as load-bearing state.
+		// opt-out scopes and scopes with export.auto:true keep JSONL as
+		// load-bearing state. A config that cannot be read back may hold that
+		// true, so the file is left for the store-open reaper to judge.
 		removeStaleBdExportJSONL(fs, beadsDir)
 	}
 	return nil
 }
 
-// removeStaleBdExportJSONL removes .beads/issues.jsonl if present. Called after
-// EnsureCanonicalConfig writes export.auto:false, since the file is a stale
-// export that bd's auto-import path would otherwise re-load on every write,
-// stalling bd create for the full subprocess timeout on large datasets.
+// removeStaleBdExportJSONL removes .beads/issues.jsonl if present. Called
+// after EnsureCanonicalConfig has canonicalized export.auto to false — that
+// is, for scopes where gc does not observe an explicit export.auto:true —
+// since the file is then a stale export that bd's auto-import path would
+// otherwise re-load on every write, stalling bd create for the full
+// subprocess timeout on large datasets.
 // Best-effort: any error is non-fatal because the env-var BD_EXPORT_AUTO=false
 // path (bdRuntimeEnv) is a second line of defense for gc-initiated calls.
 func removeStaleBdExportJSONL(fs fsys.FS, beadsDir string) {
@@ -855,8 +874,19 @@ func initAndHookDir(cityPath, dir, prefix string) error {
 		if !strings.HasPrefix(provider, "exec:") {
 			return fmt.Errorf("provider-owned scope %q requires an exec beads provider", dir)
 		}
+		// A ready scope's init op is the provider `start` (a bd ping), and the
+		// script pins bd's shared-server mode off from this pin: write it first
+		// so a scope initialized by a build that wrote none is never pinged
+		// unpinned. No-op for an unmaterialized scope; re-applied after init,
+		// which rewrites config.yaml.
+		if err := ensureGCOwnedProxiedScopeSharedServerOff(cityPath, dir); err != nil {
+			return err
+		}
 		pending, err := runProviderOwnedScopeInit(cityPath, dir, prefix, strings.TrimPrefix(provider, "exec:"))
 		if err != nil {
+			return err
+		}
+		if err := ensureGCOwnedProxiedScopeSharedServerOff(cityPath, dir); err != nil {
 			return err
 		}
 		registerProviderOwnedScopeCustomTypes(cityPath, dir)
@@ -887,6 +917,9 @@ func initAndHookDir(cityPath, dir, prefix string) error {
 		return err
 	}
 	if err := normalizeCanonicalBdScopeFilesForInit(cityPath, dir, prefix, doltDatabase); err != nil {
+		return err
+	}
+	if err := ensureGCOwnedProxiedScopeSharedServerOff(cityPath, dir); err != nil {
 		return err
 	}
 	if cityUsesBdStoreContract(cityPath) && currentResolvableManagedDoltPort(cityPath) != "" {
@@ -1194,11 +1227,12 @@ func runProviderOwnedScopeLifecycleOpContext(parent context.Context, cityPath, s
 // any wait for it and before the provider script runs. A non-nil error from it
 // is returned as-is and nothing is run.
 //
-// It exists for a verb aimed at a particular state that another holder of the
-// slot may change while this one queues: the proxied admission recover, whose
-// target generation the health loop's own recover of the same zombie may have
-// replaced with a healthy proxy by the time the slot is granted (round4
-// review F3).
+// It exists for a verb aimed at a particular state that may change while this
+// one queues: the proxied admission recover, whose target generation the
+// health loop's own recover of the same zombie may have replaced with a
+// healthy proxy by the time the slot is granted (round4 review F3), and the
+// controller's stop of a suspended scope, which a resume may have reached by
+// then (stopStillSuspendedScope).
 func runProviderOwnedScopeLifecycleOpGuarded(parent context.Context, cityPath, scopeRoot, op string, precondition func() error) error {
 	provider := beadsProvider(cityPath)
 	if !strings.HasPrefix(provider, "exec:") {
@@ -1283,6 +1317,11 @@ func runProviderOwnedScopesLifecycleOpReportingFailures(parent context.Context, 
 	for _, scopeRoot := range scopes {
 		owned, err := scopeProviderOwned(cityPath, scopeRoot)
 		if err == nil && !owned {
+			continue
+		}
+		if err == nil && op == "health" && beadsScopeIdleRetired(scopeRoot) {
+			// The proxy retired on its idle timeout. That is healthy, and a
+			// ping would only restart it for another idle period.
 			continue
 		}
 		if err == nil {
@@ -1374,6 +1413,9 @@ func runProviderOwnedScopeInit(cityPath, dir, prefix, script string) (bool, erro
 	}
 	env, err := providerLifecycleProcessEnvForScopeInitWithError(cityPath, dir, "exec:"+script)
 	if err != nil {
+		return false, err
+	}
+	if env, err = withProxiedInitIdleTimeout(env, cityPath, dir, "exec:"+script); err != nil {
 		return false, err
 	}
 	if entry.Intent.Target == "local" {
@@ -1711,7 +1753,22 @@ func ensureBeadsProvider(cityPath string) error {
 // idempotent on bd v1.3.0-rc.2, so a repeated gc stop is a clean no-op. It
 // must remain the LAST teardown step: bd restarts a proxied scope's proxy and
 // Dolt child on any read, so a reader that outlives this call undoes it.
+//
+// For that reason it first stops the city's nudge pollers, the long-lived
+// readers the city itself spawns (#6857), and then stops the store even if a
+// poller could not be stopped.
 func shutdownBeadsProvider(cityPath string) error {
+	pollersErr := stopCityNudgePollers(cityPath)
+	storeErr := stopBeadsProviderBackend(cityPath)
+	if pollersErr == nil {
+		return storeErr
+	}
+	return errors.Join(fmt.Errorf("stopping nudge pollers: %w", pollersErr), storeErr)
+}
+
+// stopBeadsProviderBackend stops the bead store's backing service. See
+// shutdownBeadsProvider, its only caller.
+func stopBeadsProviderBackend(cityPath string) error {
 	if owned, err := cityScopeProviderOwned(cityPath); err != nil {
 		return err
 	} else if owned {
@@ -1810,6 +1867,9 @@ func initBeadsForDirWithExecutor(cityPath, dir, prefix, doltDatabase string, exe
 			if err != nil {
 				return err
 			}
+			if baseEnv, err = withProxiedInitIdleTimeout(baseEnv, cityPath, dir, provider); err != nil {
+				return err
+			}
 			env := overlayEnvEntries(baseEnv, map[string]string{
 				"BEADS_DIR":                 filepath.Join(dir, ".beads"),
 				"BEADS_DOLT_PROXIED_SERVER": "1",
@@ -1842,6 +1902,9 @@ func initBeadsForDirWithExecutor(cityPath, dir, prefix, doltDatabase string, exe
 		if execProviderUsesCanonicalBdScopeFiles(provider) && !execProviderNeedsScopedDoltInit(provider) {
 			baseEnv, err := providerLifecycleProcessEnvForScopeInitWithError(cityPath, dir, provider)
 			if err != nil {
+				return err
+			}
+			if baseEnv, err = withProxiedInitIdleTimeout(baseEnv, cityPath, dir, provider); err != nil {
 				return err
 			}
 			overrides := map[string]string{
@@ -2000,12 +2063,20 @@ func initDefaultRigBdStore(cityPath, dir, prefix, doltDatabase string) error {
 	args := []string{"init", "-p", prefix, "--skip-hooks"}
 	if scopeInitUsesProxiedDoltMode(cityPath, dir) {
 		env["BEADS_DOLT_PROXIED_SERVER"] = "1"
-		// Idle-never is not an optimization, it is D3: without it bd retires
-		// the proxy and its Dolt child after 30s quiet and every later command
-		// pays a cold start. It also has to be passed for bd to write the
-		// client-info sidecar at all, which is what the lifecycle then reads
-		// to find the proxy root.
-		args = append(args[:1], "--proxied-server", "--proxied-server-idle-timeout", "0", "-p", prefix, "--skip-hooks")
+		// bd init under a user-level dolt.shared-server: true would root the
+		// new proxy in ~/.beads/shared-server and persist that choice into the
+		// scope's config.yaml. See applyProxiedSharedServerOptOut.
+		applyProxiedSharedServerOptOut(env)
+		// The idle timeout is always passed explicitly: left out, bd retires
+		// the proxy and its Dolt child after its own 30s default, and it is
+		// also what makes bd write the client-info sidecar the lifecycle reads
+		// to find the proxy root. The value is the configured one
+		// ([beads] proxied_idle_timeout, the rig override, or the env).
+		idle, err := resolveScopeProxiedIdleTimeout(cityPath, dir, os.Stderr)
+		if err != nil {
+			return err
+		}
+		args = append(args[:1], "--proxied-server", "--proxied-server-idle-timeout", idle.BdFlagValue(), "-p", prefix, "--skip-hooks")
 	} else {
 		args = append(args[:1], "--server", "-p", prefix, "--skip-hooks")
 	}
@@ -2051,7 +2122,7 @@ func finalizeCanonicalBdScopeInit(cityPath, dir, prefix, doltDatabase string) er
 	// that path can run direct SQL preflight and would either fail before the
 	// proxy is ready or accidentally create a second managed server.
 	if scopeInitUsesProxiedDoltMode(cityPath, dir) {
-		return nil
+		return ensureGCOwnedProxiedScopeSharedServerOff(cityPath, dir)
 	}
 	store, err := openStoreAtForCity(dir, cityPath)
 	if err != nil {
@@ -2301,8 +2372,9 @@ func waitForAllBeadsScopesReadyAfterRecovery(ctx context.Context, cityPath strin
 		return nil
 	}
 	resolveRigPaths(cityPath, cfg.Rigs)
+	suspended := suspendedBeadsScopes(cityPath, cfg)
 	for _, rig := range cfg.Rigs {
-		if strings.TrimSpace(rig.Path) == "" {
+		if strings.TrimSpace(rig.Path) == "" || suspended.Suspended(rig.Path) {
 			continue
 		}
 		if err := waitForBeadsScopeReadyAfterRecovery(ctx, resolveStoreScopeRoot(cityPath, rig.Path), cityPath, deadline); err != nil {
@@ -2540,7 +2612,7 @@ func validDoltRuntimeStateIdentity(state doltRuntimeState, cityPath string) (man
 }
 
 func managedDoltRuntimeProcessOwned(state doltRuntimeState, layout managedDoltRuntimeLayout) bool {
-	holderPID := findPortHolderPID(strconv.Itoa(state.Port))
+	holderPID := findPortHolderPID(strconv.Itoa(state.Port), state.PID)
 	if holderPID > 0 && holderPID != state.PID {
 		return false
 	}
@@ -3468,6 +3540,22 @@ func providerLifecycleProcessEnvForScopeInitWithError(cityPath, scopeRoot, provi
 	return env, nil
 }
 
+// withProxiedInitIdleTimeout adds the idle timeout gc resolved for scopeRoot
+// to the env of a provider `init` op; the script's proxied init arms refuse to
+// run without it rather than fall back to an idle policy nobody configured.
+// Only init carries it: start, health, recover and stop never resolve the
+// value, so a bad one cannot fail them and they read no config for it.
+func withProxiedInitIdleTimeout(env []string, cityPath, scopeRoot, provider string) ([]string, error) {
+	if !providerUsesBdStoreContract(provider) {
+		return env, nil
+	}
+	idle, err := resolveScopeProxiedIdleTimeout(cityPath, scopeRoot, os.Stderr)
+	if err != nil {
+		return nil, err
+	}
+	return overlayEnvEntries(env, map[string]string{config.ProxiedIdleTimeoutEnv: idle.BdFlagValue()}), nil
+}
+
 func providerLifecycleIndependentScopeInitEnv(cityPath, scopeRoot string, env []string) []string {
 	cityPath = normalizePathForCompare(cityPath)
 	overrides := map[string]string{}
@@ -3526,6 +3614,8 @@ func providerLifecycleProcessEnvFromBase(cityPath, provider string, env []string
 		}
 		if entry.Intent.Transport == "proxied" {
 			applyProxiedDoltEnv(envMap)
+			// A journaled, initializing scope is gc-owned by construction.
+			applyProxiedSharedServerOptOut(envMap)
 		}
 		return mergeRuntimeEnv(nil, envMap), nil
 	}

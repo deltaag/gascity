@@ -119,6 +119,54 @@ func TestMarshalDefaultCityFormat(t *testing.T) {
 	}
 }
 
+// TestDaemonSessionReconcilerModeParses pins the switch's vocabulary: the
+// gc-enterprise spellings are aliases for legacy, never v2, spelling is case-
+// and space-tolerant, and an unknown value is reported rather than read as
+// legacy (the controller latch refuses it).
+func TestDaemonSessionReconcilerModeParses(t *testing.T) {
+	for _, tc := range []struct {
+		raw   string
+		mode  string
+		alias bool
+		ok    bool
+	}{
+		{raw: "", mode: SessionReconcilerLegacy, ok: true},
+		{raw: "legacy", mode: SessionReconcilerLegacy, ok: true},
+		{raw: " Legacy ", mode: SessionReconcilerLegacy, ok: true},
+		{raw: "v2", mode: SessionReconcilerV2, ok: true},
+		{raw: "V2", mode: SessionReconcilerV2, ok: true},
+		{raw: "off", mode: SessionReconcilerLegacy, alias: true, ok: true},
+		{raw: "auto", mode: SessionReconcilerLegacy, alias: true, ok: true},
+		{raw: "require", mode: SessionReconcilerLegacy, alias: true, ok: true},
+		{raw: "v3"},
+	} {
+		mode, alias, ok := DaemonConfig{SessionReconciler: tc.raw}.SessionReconcilerMode()
+		if mode != tc.mode || alias != tc.alias || ok != tc.ok {
+			t.Errorf("SessionReconcilerMode(%q) = (%q, alias=%v, ok=%v), want (%q, alias=%v, ok=%v)",
+				tc.raw, mode, alias, ok, tc.mode, tc.alias, tc.ok)
+		}
+	}
+}
+
+// TestIsSessionReconcilerAliasWarningMatchesSuffixOnly pins that the alias
+// marker counts only at the end of a warning: an unknown value whose text
+// carries the marker mid-string must stay strict-fatal.
+func TestIsSessionReconcilerAliasWarningMatchesSuffixOnly(t *testing.T) {
+	alias := sessionReconcilerWarnings(&City{Daemon: DaemonConfig{SessionReconciler: "auto"}}, "city.toml")
+	if len(alias) != 1 || !IsSessionReconcilerAliasWarning(alias[0]) {
+		t.Fatalf("alias warnings = %q, want one recognized alias deprecation", alias)
+	}
+	for _, w := range []string{
+		"city.toml: [daemon] session_reconciler = x " + sessionReconcilerAliasMarker + " is not a known value",
+		sessionReconcilerAliasMarker + "; trailing text",
+		"",
+	} {
+		if IsSessionReconcilerAliasWarning(w) {
+			t.Errorf("IsSessionReconcilerAliasWarning(%q) = true, want false: the marker is not the suffix", w)
+		}
+	}
+}
+
 func TestParseDefaultsFormulaV2Enabled(t *testing.T) {
 	cfg, err := Parse([]byte(`
 [workspace]
@@ -5655,6 +5703,55 @@ func TestMailConfigRetentionTTLDurationRejectsInvalid(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "[mail] retention_ttl") || !strings.Contains(err.Error(), "7d") {
 		t.Fatalf("RetentionTTLDuration() error = %q, want field context and bad value", err)
+	}
+}
+
+func TestMailConfigUnreadRetentionTTLDuration(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		want time.Duration
+	}{
+		{name: "empty", raw: "", want: 0},
+		{name: "zero", raw: "0", want: 0},
+		{name: "hours", raw: "168h", want: 168 * time.Hour},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := (MailConfig{UnreadRetentionTTL: tt.raw}).UnreadRetentionTTLDuration()
+			if err != nil {
+				t.Fatalf("UnreadRetentionTTLDuration() error = %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("UnreadRetentionTTLDuration() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestMailConfigUnreadRetentionTTLDurationRejectsInvalid(t *testing.T) {
+	for _, raw := range []string{"7d", "-1h"} {
+		_, err := (MailConfig{UnreadRetentionTTL: raw}).UnreadRetentionTTLDuration()
+		if err == nil {
+			t.Fatalf("UnreadRetentionTTLDuration(%q) succeeded, want error", raw)
+		}
+		if !strings.Contains(err.Error(), "[mail] unread_retention_ttl") || !strings.Contains(err.Error(), raw) {
+			t.Fatalf("UnreadRetentionTTLDuration(%q) error = %q, want field context and bad value", raw, err)
+		}
+	}
+}
+
+func TestMailConfigUnreadRetentionTTLParsesFromTOML(t *testing.T) {
+	cfg, err := Parse([]byte("[mail]\nunread_retention_ttl = \"168h\"\n"))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if cfg.Mail.UnreadRetentionTTL != "168h" {
+		t.Fatalf("Mail.UnreadRetentionTTL = %q, want 168h", cfg.Mail.UnreadRetentionTTL)
+	}
+	d, err := cfg.Mail.UnreadRetentionTTLDuration()
+	if err != nil || d != 168*time.Hour {
+		t.Fatalf("UnreadRetentionTTLDuration() = %v, %v; want 168h, nil", d, err)
 	}
 }
 

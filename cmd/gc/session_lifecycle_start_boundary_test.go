@@ -4,16 +4,36 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/clock"
+	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/events"
+	"github.com/gastownhall/gascity/internal/fsys"
 	"github.com/gastownhall/gascity/internal/runtime"
 	sessionpkg "github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/session/sessiontest"
+	"github.com/gastownhall/gascity/internal/suspensionstate"
 )
+
+type blockingStartProvider struct {
+	runtime.Provider
+	started chan struct{}
+	release chan struct{}
+}
+
+func (p *blockingStartProvider) Start(ctx context.Context, name string, cfg runtime.Config) error {
+	close(p.started)
+	select {
+	case <-p.release:
+		return p.Provider.Start(ctx, name, cfg)
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
 
 type startUnavailableLivenessProvider struct {
 	*runtime.Fake
@@ -44,7 +64,7 @@ func TestExecutePreparedStartWaveUsesWorkerBoundaryForKnownSession(t *testing.T)
 		t.Fatalf("Get bead: %v", err)
 	}
 
-	results := executePreparedStartWave(
+	results := executePreparedStartWaveForCity(
 		context.Background(),
 		[]preparedStart{{
 			candidate: startCandidate{
@@ -56,9 +76,11 @@ func TestExecutePreparedStartWaveUsesWorkerBoundaryForKnownSession(t *testing.T)
 				WorkDir: info.WorkDir,
 			},
 		}},
+		t.TempDir(),
 		sp,
 		store,
-		10*time.Second,
+		nil,
+		10*time.Second, 1,
 	)
 	if len(results) != 1 {
 		t.Fatalf("len(results) = %d, want 1", len(results))
@@ -87,6 +109,7 @@ func TestExecutePreparedStartWaveUsesWorkerBoundaryForKnownSession(t *testing.T)
 }
 
 func TestStartPreparedStartCandidateUsesWorkerBoundaryForRuntimeOnlyTarget(t *testing.T) {
+	city := t.TempDir()
 	sp := runtime.NewFake()
 
 	usedWorker, err := startPreparedStartCandidate(
@@ -101,7 +124,7 @@ func TestStartPreparedStartCandidateUsesWorkerBoundaryForRuntimeOnlyTarget(t *te
 				WorkDir: t.TempDir(),
 			},
 		},
-		"",
+		city,
 		nil,
 		sp,
 		nil,
@@ -138,7 +161,64 @@ func TestStartPreparedStartCandidateUsesWorkerBoundaryForRuntimeOnlyTarget(t *te
 	}
 }
 
+func TestStartPreparedStartCandidateRefusesRigSuspendedBeforeSpawn(t *testing.T) {
+	cityPath := t.TempDir()
+	suspended := true
+	if err := suspensionstate.SetRigSuspended(fsys.OSFS{}, cityPath, "aoa", &suspended); err != nil {
+		t.Fatalf("SetRigSuspended: %v", err)
+	}
+	sp := runtime.NewFake()
+	rig := config.Rig{Name: "aoa", Path: "/rig/aoa"}
+	_, err := startPreparedStartCandidate(context.Background(), preparedStart{
+		candidate: startCandidate{
+			info: sessionpkg.Info{SessionName: "aoa--worker-1", SessionNameMetadata: "aoa--worker-1"},
+			tp:   TemplateParams{TemplateName: "worker", RigName: "aoa"},
+		},
+		cfg: runtime.Config{Command: "claude", WorkDir: t.TempDir()},
+	}, cityPath, nil, sp, &config.City{Rigs: []config.Rig{rig}}, nil, nil, nil)
+	if err == nil || !strings.Contains(err.Error(), `rig "aoa" is suspended`) {
+		t.Fatalf("error = %v, want suspended rig refusal", err)
+	}
+	if sp.CountCalls("Start", "aoa--worker-1") != 0 {
+		t.Fatal("provider Start ran after suspension landed before spawn")
+	}
+}
+
+func TestStartPreparedStartCandidateDoesNotKillSessionSuspendedDuringSpawn(t *testing.T) {
+	cityPath := t.TempDir()
+	fake := runtime.NewFake()
+	sp := &blockingStartProvider{Provider: fake, started: make(chan struct{}), release: make(chan struct{})}
+	rig := config.Rig{Name: "aoa", Path: "/rig/aoa"}
+	done := make(chan error, 1)
+	go func() {
+		_, err := startPreparedStartCandidate(context.Background(), preparedStart{
+			candidate: startCandidate{
+				info: sessionpkg.Info{SessionName: "aoa--worker-1", SessionNameMetadata: "aoa--worker-1"},
+				tp:   TemplateParams{TemplateName: "worker", RigName: "aoa"},
+			},
+			cfg: runtime.Config{Command: "claude", WorkDir: t.TempDir()},
+		}, cityPath, nil, sp, &config.City{Rigs: []config.Rig{rig}}, nil, nil, nil)
+		done <- err
+	}()
+	<-sp.started
+	suspended := true
+	if err := suspensionstate.SetRigSuspended(fsys.OSFS{}, cityPath, "aoa", &suspended); err != nil {
+		t.Fatalf("SetRigSuspended: %v", err)
+	}
+	close(sp.release)
+	if err := <-done; err != nil {
+		t.Fatalf("in-flight start returned %v, want completion", err)
+	}
+	if !fake.IsRunning("aoa--worker-1") {
+		t.Fatal("session crossing the suspension boundary was killed")
+	}
+	if fake.CountCalls("Stop", "aoa--worker-1") != 0 {
+		t.Fatal("suspension killed an in-flight session")
+	}
+}
+
 func TestStartPreparedStartCandidateDefersWhenLivenessUnavailable(t *testing.T) {
+	testCity := t.TempDir()
 	sp := &startUnavailableLivenessProvider{Fake: runtime.NewFake()}
 
 	started, err := startPreparedStartCandidate(
@@ -150,7 +230,7 @@ func TestStartPreparedStartCandidateDefersWhenLivenessUnavailable(t *testing.T) 
 			},
 			cfg: runtime.Config{Command: "claude", WorkDir: t.TempDir()},
 		},
-		"",
+		testCity,
 		nil,
 		sp,
 		nil,
@@ -173,6 +253,7 @@ func TestStartPreparedStartCandidateDefersWhenLivenessUnavailable(t *testing.T) 
 }
 
 func TestStartPreparedStartCandidateConvergesFromConfirmedAbsence(t *testing.T) {
+	city := t.TempDir()
 	sp := &startConfirmedAbsentProvider{Fake: runtime.NewFake()}
 	started, err := startPreparedStartCandidate(
 		context.Background(),
@@ -183,7 +264,8 @@ func TestStartPreparedStartCandidateConvergesFromConfirmedAbsence(t *testing.T) 
 			},
 			cfg: runtime.Config{Command: "claude", WorkDir: t.TempDir()},
 		},
-		"", nil, sp, nil, nil, nil, nil,
+		city,
+		nil, sp, nil, nil, nil, nil,
 	)
 	if err != nil || !started {
 		t.Fatalf("startPreparedStartCandidate = (%v, %v), want started without error", started, err)
@@ -223,7 +305,7 @@ func TestExecutePreparedStartWaveDefersUnavailableWithoutRollbackOrWakeFailure(t
 				t.Fatalf("Create session: %v", err)
 			}
 			sp := &startUnavailableLivenessProvider{Fake: runtime.NewFake()}
-			results := executePreparedStartWave(
+			results := executePreparedStartWaveForCity(
 				context.Background(),
 				[]preparedStart{{
 					candidate: startCandidate{
@@ -232,9 +314,11 @@ func TestExecutePreparedStartWaveDefersUnavailableWithoutRollbackOrWakeFailure(t
 					},
 					cfg: runtime.Config{Command: "claude", WorkDir: t.TempDir()},
 				}},
+				t.TempDir(),
 				sp,
 				store,
-				10*time.Second,
+				nil,
+				10*time.Second, 1,
 			)
 			if len(results) != 1 {
 				t.Fatalf("len(results) = %d, want 1", len(results))
