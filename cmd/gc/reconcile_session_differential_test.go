@@ -159,10 +159,6 @@ var parityFindings = map[string]parityEntry{
 	// the conversation of a provider without a keyed transcript. v2's
 	// dead-runtime accrual writes that reset (deadRuntimePatch); C5a2's
 	// start failure must write the same ConversationResetPatch(true).
-	"idle-activity-unread": {
-		"BEHAVIORS SESS-601/585 (A20 idle begin, AL1 stage 6b); C6a2 replay finding (owner to rule)", "legacy idle-sleeps a live row its probe reads idle past sleep_after_idle (its drain, latch, signal and stop in one tick); v2's AL1 suppresses a live row only on a known I3 activity fact (configSleepSuppressed), and no observer sets LastActivityKnown, so v2 never decides the idle sleep of a live non-interactive or always-named session (AL1's idle stage covers on-demand and pool rows from detached_at), and A20's idle begin and latch do not fire there (C6a2b)",
-		[]string{"detached_at", "drain_at", "last_woke_at", "sleep_reason", "slept_at", "state"},
-	},
 	"mislabelled-close": {"CONTRACT v5 AL1, A1", "legacy closes a row with no template and no session name as orphaned; v2's A1 leaves it open as None, which §12.2 does not list", []string{"status", "state", "close_reason", "closed_at"}},
 }
 
@@ -1122,17 +1118,14 @@ func parityFixtures() []parityFixture {
 			Rows: []parityRow{awake("last_woke_at", at(-time.Hour))}, Work: assigned, Runtimes: []simRuntime{live},
 		},
 		{
-			// An always named session idle past sleep_after_idle: both begin
-			// its idle drain and write the latch, the row's sleep policy
-			// fingerprint; legacy also signals and stops it in the tick (A4).
+			// An always named session idle past sleep_after_idle, its
+			// activity an hour old as the observation lane reads it (C6a2b):
+			// both begin its idle drain and write the latch, which is
+			// compared; legacy also signals and stops it in the tick (A4).
 			Name: "an idle drain begin writes the sleep policy fingerprint", Behaviors: []string{"SESS-601"}, City: chatNapping,
 			Rows:     []parityRow{chatRow("gc-c", "1", "state", "awake", "session_name", "chat", "instance_token", "tok-gc-c", "last_woke_at", at(-time.Hour), "detached_at", at(-time.Hour))},
-			Runtimes: []simRuntime{{id: "gc-c", epoch: "1", token: "tok-gc-c"}}, Idle: []string{"gc-c"},
-			Explain: map[string]string{
-				"row:gc-c:*policy": "sleep-policy-keys", "row:gc-c:*sync": "A7 row-metadata", "row:gc-c:*idle": "idle-activity-unread",
-				"provider:SetMeta chat": "idle-activity-unread", "provider:RemoveMeta chat": "idle-activity-unread", "provider:Stop chat": "idle-activity-unread",
-				"event:session.stopped chat [reason session_id template]": "idle-activity-unread",
-			},
+			Runtimes: []simRuntime{chatLive}, Idle: []string{"gc-c"},
+			Explain: tlMerged(latchCompared(stopsInTick("A4 idle-sleep")), map[string]string{"row:gc-c:config_wake_suppressed": "sleep-policy-keys"}),
 		},
 		{
 			// A pool row awake only for ready, unclaimed assigned work, idle
