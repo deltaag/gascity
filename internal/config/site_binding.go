@@ -160,7 +160,9 @@ func SiteBindingPath(cityRoot string) string {
 	return filepath.Join(cityRoot, citylayout.RuntimeRoot, "site.toml")
 }
 
-// SiteBinding stores machine-local rig bindings for a city.
+// SiteBinding stores machine-local rig bindings for a city. It models only
+// the fields gc owns; rewrites of .gc/site.toml preserve every other table
+// and key (see persistSiteBinding).
 type SiteBinding struct {
 	WorkspaceName   string           `toml:"workspace_name,omitempty"`
 	WorkspacePrefix string           `toml:"workspace_prefix,omitempty"`
@@ -688,13 +690,22 @@ func PersistWorkspaceSiteBinding(fs fsys.FS, cityRoot, name, prefix string) erro
 	return persistSiteBinding(fs, cityRoot, binding)
 }
 
+// persistSiteBinding writes binding's known fields into .gc/site.toml while
+// round-tripping every table and key this binary does not model (future site
+// overlays, unknown per-rig keys). The file is removed only when nothing at
+// all remains after the known fields are applied.
 func persistSiteBinding(fs fsys.FS, cityRoot string, binding SiteBinding) error {
 	path := SiteBindingPath(cityRoot)
 	writePath, err := fsys.ResolveSymlinks(fs, path)
 	if err != nil {
 		return fmt.Errorf("resolving site binding %q for rewrite: %w", path, err)
 	}
-	if len(binding.Rigs) == 0 && binding.WorkspaceName == "" && binding.WorkspacePrefix == "" {
+	doc, err := loadSiteBindingDocument(fs, writePath)
+	if err != nil {
+		return err
+	}
+	mergeSiteBindingIntoDocument(doc, binding)
+	if len(doc) == 0 {
 		if err := fs.Remove(writePath); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("removing site binding %q: %w", writePath, err)
 		}
@@ -704,7 +715,7 @@ func persistSiteBinding(fs fsys.FS, cityRoot string, binding SiteBinding) error 
 	var buf bytes.Buffer
 	enc := toml.NewEncoder(&buf)
 	enc.Indent = ""
-	if err := enc.Encode(binding); err != nil {
+	if err := enc.Encode(doc); err != nil {
 		return fmt.Errorf("marshaling site binding: %w", err)
 	}
 	if err := fs.MkdirAll(filepath.Dir(writePath), 0o755); err != nil {
@@ -717,4 +728,76 @@ func persistSiteBinding(fs fsys.FS, cityRoot string, binding SiteBinding) error 
 		return fmt.Errorf("writing site binding %q: %w", writePath, err)
 	}
 	return nil
+}
+
+// TOML keys of the SiteBinding fields persistSiteBinding owns. Everything
+// else in .gc/site.toml is carried through rewrites untouched.
+const (
+	siteBindingKeyWorkspaceName   = "workspace_name"
+	siteBindingKeyWorkspacePrefix = "workspace_prefix"
+	siteBindingKeyRig             = "rig"
+	siteBindingKeyRigName         = "name"
+	siteBindingKeyRigPath         = "path"
+)
+
+// loadSiteBindingDocument decodes the whole of .gc/site.toml generically so a
+// rewrite can preserve content SiteBinding does not model. A missing file
+// yields an empty document.
+func loadSiteBindingDocument(fs fsys.FS, path string) (map[string]any, error) {
+	doc := map[string]any{}
+	data, err := fs.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return doc, nil
+		}
+		return nil, fmt.Errorf("loading site binding %q: %w", path, err)
+	}
+	if _, err := toml.Decode(string(data), &doc); err != nil {
+		return nil, fmt.Errorf("parsing site binding %q: %w", path, err)
+	}
+	return doc, nil
+}
+
+// mergeSiteBindingIntoDocument replaces the known SiteBinding fields in doc
+// with binding's values. Empty fields are removed. Each written rig entry
+// starts from the existing entry with the same name, so unknown per-rig keys
+// survive while name and path are owned by binding.
+func mergeSiteBindingIntoDocument(doc map[string]any, binding SiteBinding) {
+	setOrDeleteSiteKey(doc, siteBindingKeyWorkspaceName, binding.WorkspaceName)
+	setOrDeleteSiteKey(doc, siteBindingKeyWorkspacePrefix, binding.WorkspacePrefix)
+
+	existing := map[string]map[string]any{}
+	if entries, ok := doc[siteBindingKeyRig].([]map[string]any); ok {
+		for _, entry := range entries {
+			name, _ := entry[siteBindingKeyRigName].(string)
+			name = strings.TrimSpace(name)
+			if _, dup := existing[name]; name != "" && !dup {
+				existing[name] = entry
+			}
+		}
+	}
+	if len(binding.Rigs) == 0 {
+		delete(doc, siteBindingKeyRig)
+		return
+	}
+	rigs := make([]map[string]any, 0, len(binding.Rigs))
+	for _, rig := range binding.Rigs {
+		entry := existing[rig.Name]
+		if entry == nil {
+			entry = map[string]any{}
+		}
+		delete(existing, rig.Name)
+		entry[siteBindingKeyRigName] = rig.Name
+		setOrDeleteSiteKey(entry, siteBindingKeyRigPath, rig.Path)
+		rigs = append(rigs, entry)
+	}
+	doc[siteBindingKeyRig] = rigs
+}
+
+func setOrDeleteSiteKey(doc map[string]any, key, value string) {
+	if value == "" {
+		delete(doc, key)
+		return
+	}
+	doc[key] = value
 }
