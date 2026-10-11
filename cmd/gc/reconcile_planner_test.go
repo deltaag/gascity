@@ -695,6 +695,9 @@ func TestPlannerPacingIgnoresOneStretchedPass(t *testing.T) {
 			case 2:
 				h.clk.Advance(101 * time.Second) // frozen mid-pass
 				h.p.markDirty("test")
+			case 3:
+				h.clk.Advance(50 * time.Second)
+				h.p.markDirty("test")
 			}
 			return passResult{}
 		})
@@ -708,21 +711,38 @@ func TestPlannerPacingIgnoresOneStretchedPass(t *testing.T) {
 		h.expectPass(t, second)
 		third := second.Add(101 * time.Second) // 4 × min(1s, 101s): due at the thaw, at once
 		h.expectPass(t, third)
+		// The window moves: the pass before last is now the 101s one.
+		fourth := third.Add(200 * time.Second) // 4 × min(101s, 50s)
+		h.clk.waitArmed(t, fourth)
+		h.clk.Advance(150 * time.Second)
+		h.expectPass(t, fourth)
 	})
-	t.Run("capped at the patrol", func(t *testing.T) {
-		first := true
-		h := newPlannerHarness(t, func(h *plannerHarness, _ time.Time) passResult {
-			if first {
-				first = false
-				h.clk.Advance(101 * time.Second)
-				h.p.markDirty("test")
-			}
-			return passResult{}
+	for _, c := range []struct {
+		name string
+		pass time.Duration
+	}{
+		{"capped at the patrol after a stretched pass", 101 * time.Second},
+		{"capped at the patrol after a slow pass", 10 * time.Second},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			first := true
+			h := newPlannerHarness(t, func(h *plannerHarness, _ time.Time) passResult {
+				if first {
+					first = false
+					h.clk.Advance(c.pass)
+					h.p.markDirty("test")
+				}
+				return passResult{}
+			})
+			h.start(t)
+			h.p.markDirty("test")
+			h.expectPass(t, plannerT0)
+			// The 15s patrol's due time, one patrol after the pass ended,
+			// is sooner than 4 × the pass.
+			next := plannerT0.Add(c.pass + 15*time.Second)
+			h.clk.waitArmed(t, next)
+			h.clk.Advance(15 * time.Second)
+			h.expectPass(t, next)
 		})
-		h.start(t)
-		h.p.markDirty("test")
-		h.expectPass(t, plannerT0)
-		next := plannerT0.Add(101 * time.Second) // past the 15s patrol cap: at once
-		h.expectPass(t, next)
-	})
+	}
 }
