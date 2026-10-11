@@ -385,12 +385,12 @@ event:session.stopped worker {"reason":"drain acknowledged","session_id":"gc-1",
 provider:RemoveMeta s-gc-1 legacy="6" v2="" [A20 drain-begin]
 provider:SetMeta s-gc-1 legacy="4" v2="" [A20 drain-begin]
 provider:Stop s-gc-1 legacy="1" v2="" [A20 drain-begin]
-row:gc-1:close_reason legacy="session drained: pool slot retired by reconciler" v2="" [A21 close]
-row:gc-1:closed_at legacy="T+4m0s" v2="" [A21 close]
+row:gc-1:close_reason legacy="session drained: pool slot retired by reconciler" v2="" [A20 drain-begin]
+row:gc-1:closed_at legacy="T+4m0s" v2="" [A20 drain-begin]
 row:gc-1:drain_at legacy="T+4m0s" v2="" [A20 drain-begin]
-row:gc-1:state legacy="drained" v2="awake" [A21 close]
+row:gc-1:state legacy="drained" v2="awake" [A20 drain-begin]
 row:gc-1:state_reason legacy="drain-ack-stop-pending" v2="" [A20 drain-begin]
-row:gc-1:status legacy="closed" v2="open" [A21 close]
+row:gc-1:status legacy="closed" v2="open" [A20 drain-begin]
 row:gc-1:synced_at legacy="T+4m0s" v2="" [A7 row-metadata]
 runtime:s-gc-1 legacy="" v2="id=gc-1 epoch=1 token=tok-gc-1 alive attached=false" [A20 drain-begin]
 @ +4m10s
@@ -406,12 +406,12 @@ event:session.stopped worker {"reason":"drain acknowledged","session_id":"gc-1",
 provider:RemoveMeta s-gc-1 legacy="6" v2="" [A20 drain-begin]
 provider:SetMeta s-gc-1 legacy="4" v2="" [A20 drain-begin]
 provider:Stop s-gc-1 legacy="1" v2="" [A20 drain-begin]
-row:gc-1:close_reason legacy="session drained: pool slot retired by reconciler" v2="" [A21 close]
-row:gc-1:closed_at legacy="T+0s" v2="" [A21 close]
+row:gc-1:close_reason legacy="session drained: pool slot retired by reconciler" v2="" [A20 drain-begin]
+row:gc-1:closed_at legacy="T+0s" v2="" [A20 drain-begin]
 row:gc-1:drain_at legacy="T+0s" v2="" [A20 drain-begin]
-row:gc-1:state legacy="drained" v2="awake" [A21 close]
+row:gc-1:state legacy="drained" v2="awake" [A20 drain-begin]
 row:gc-1:state_reason legacy="drain-ack-stop-pending" v2="" [A20 drain-begin]
-row:gc-1:status legacy="closed" v2="open" [A21 close]
+row:gc-1:status legacy="closed" v2="open" [A20 drain-begin]
 row:gc-1:synced_at legacy="T+0s" v2="" [A7 row-metadata]
 runtime:s-gc-1 legacy="" v2="id=gc-1 epoch=1 token=tok-gc-1 alive attached=false" [A20 drain-begin]
 @ +10s
@@ -427,12 +427,12 @@ event:session.stopped worker {"reason":"drain acknowledged","session_id":"gc-1",
 provider:RemoveMeta s-gc-1 legacy="6" v2="" [A20 drain-begin]
 provider:SetMeta s-gc-1 legacy="4" v2="" [A20 drain-begin]
 provider:Stop s-gc-1 legacy="1" v2="" [A20 drain-begin]
-row:gc-1:close_reason legacy="session drained: pool slot retired by reconciler" v2="" [A21 close]
-row:gc-1:closed_at legacy="T+0s" v2="" [A21 close]
+row:gc-1:close_reason legacy="session drained: pool slot retired by reconciler" v2="" [A20 drain-begin]
+row:gc-1:closed_at legacy="T+0s" v2="" [A20 drain-begin]
 row:gc-1:drain_at legacy="T+0s" v2="" [A20 drain-begin]
-row:gc-1:state legacy="drained" v2="awake" [A21 close]
+row:gc-1:state legacy="drained" v2="awake" [A20 drain-begin]
 row:gc-1:state_reason legacy="drain-ack-stop-pending" v2="" [A20 drain-begin]
-row:gc-1:status legacy="closed" v2="open" [A21 close]
+row:gc-1:status legacy="closed" v2="open" [A20 drain-begin]
 row:gc-1:synced_at legacy="T+0s" v2="" [A7 row-metadata]
 runtime:s-gc-1 legacy="" v2="id=gc-1 epoch=1 token=tok-gc-1 alive attached=false" [A20 drain-begin]
 @ +10s
@@ -449,12 +449,12 @@ event:session.stopped worker {"reason":"drain acknowledged","session_id":"gc-1",
 provider:RemoveMeta s-gc-1 legacy="6" v2="" [A20 drain-begin]
 provider:SetMeta s-gc-1 legacy="4" v2="" [A20 drain-begin]
 provider:Stop s-gc-1 legacy="1" v2="" [A20 drain-begin]
-row:gc-1:close_reason legacy="session drained: pool slot retired by reconciler" v2="" [A21 close]
-row:gc-1:closed_at legacy="T+7m0s" v2="" [A21 close]
+row:gc-1:close_reason legacy="session drained: pool slot retired by reconciler" v2="" [A20 drain-begin]
+row:gc-1:closed_at legacy="T+7m0s" v2="" [A20 drain-begin]
 row:gc-1:drain_at legacy="T+7m0s" v2="" [A20 drain-begin]
-row:gc-1:state legacy="drained" v2="awake" [A21 close]
+row:gc-1:state legacy="drained" v2="awake" [A20 drain-begin]
 row:gc-1:state_reason legacy="drain-ack-stop-pending" v2="" [A20 drain-begin]
-row:gc-1:status legacy="closed" v2="open" [A21 close]
+row:gc-1:status legacy="closed" v2="open" [A20 drain-begin]
 row:gc-1:synced_at legacy="T+7m0s" v2="" [A7 row-metadata]
 runtime:s-gc-1 legacy="" v2="id=gc-1 epoch=1 token=tok-gc-1 alive attached=false" [A20 drain-begin]
 @ +7m10s
@@ -574,13 +574,6 @@ provider:RemoveMeta s-gc-1 resolved
 provider:SetMeta s-gc-1 resolved
 ## 1 kill (+40s)
 ## 2 past the kill grace (+7m10s)
-@ +5m20s
-row:gc-1:close_reason legacy="session terminated: killed" v2="" [A21 killed-seat]
-row:gc-1:closed_at legacy="T+5m20s" v2="" [A21 killed-seat]
-row:gc-1:state legacy="killed" v2="asleep" [A21 killed-seat]
-row:gc-1:status legacy="closed" v2="open" [A21 killed-seat]
-row:gc-1:synced_at legacy="T+5m20s" v2="T+0s" [A7 row-metadata]
-work:gw-1:assignee legacy="" v2="gc-1" [A21 killed-seat]
 === kill a seat holding a ready claim
 ## 0 seed (+20s)
 @ +0s

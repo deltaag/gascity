@@ -272,6 +272,15 @@ type simBacking struct{ *beads.MemStore }
 
 func (simBacking) CachedReadExact() bool { return true }
 
+// simLegBacking is the simulator's leg backing: simBacking with the atomic
+// terminal close the v2 close effect requires (closeRow), as the city's
+// SQLite sessions store has.
+type simLegBacking struct{ simBacking }
+
+func (b simLegBacking) CloseWithMetadataIfMatch(id string, expectedRevision int64, metadata map[string]string) (beads.Bead, error) {
+	return beads.AtomicCloserOver(b.MemStore).CloseWithMetadataIfMatch(id, expectedRevision, metadata)
+}
+
 // simLeg is one census leg: its backing, the cache the controller reads and
 // writes through, and the outside writers' events, which a step delivers.
 type simLeg struct {
@@ -380,7 +389,7 @@ func newSim(t *testing.T, seed uint64, o simOpts) *sim {
 		if err := beads.StampOpenedStore(m, "MemStore", gate.Require, nil, nil); err != nil {
 			t.Fatalf("stamp: %v", err)
 		}
-		cache := beads.NewCachingStoreForTest(simBacking{m}, nil, beads.WithClock(s.clk.Now)) // its windows run on sim time
+		cache := beads.NewCachingStoreForTest(simLegBacking{simBacking{m}}, nil, beads.WithClock(s.clk.Now)) // its windows run on sim time
 		if err := cache.Prime(context.Background()); err != nil {
 			t.Fatalf("prime %s: %v", name, err)
 		}
@@ -398,6 +407,7 @@ func newSim(t *testing.T, seed uint64, o simOpts) *sim {
 		CityPath: t.TempDir(), CityName: "test-city",
 		Env:          func() *reconcileEnv { return env },
 		Sessions:     func() beads.Store { return s.legs[0].cache },
+		WorkStore:    func() beads.Store { return s.legs[0].cache }, // the city's work and sessions share a store
 		RigStores:    func() map[string]beads.Store { return map[string]beads.Store{simRigLeg: s.legs[1].cache} },
 		Recording:    func() *externalReadsRecording { return nil },
 		Observations: func() *ObservationCache { return s.lane.cache },
@@ -432,6 +442,7 @@ func newSim(t *testing.T, seed uint64, o simOpts) *sim {
 	s.p.pass = func(now time.Time) passResult { return s.p.tracePass(s.env, now) }
 	s.p.effects = s.x
 	withSpecs(t, func(specs map[string]effectSpec) {
+		maps.Copy(specs, simBaseSpecs) // a sim before this one in the test gated the live table
 		if o.specs != nil {
 			o.specs(specs)
 		}
@@ -486,6 +497,12 @@ func (s *sim) seedRows() (city, rig []beads.Bead) {
 }
 
 func (s *sim) rel(d time.Duration) string { return s.clk.Now().Add(d).UTC().Format(time.RFC3339) }
+
+// simBaseSpecs is the effect table as the package declares it. Each sim
+// gates a copy of this one, never the live table a sim before it in the same
+// test already gated: gating a gated spec parks it twice, and the inner park
+// is never released.
+var simBaseSpecs = effectSpecs
 
 // gate wraps every effect in specs (around, outside the spec's own) so it
 // parks until a step releases it.

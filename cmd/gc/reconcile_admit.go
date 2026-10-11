@@ -114,6 +114,8 @@ type intent struct {
 	// Heal is the A6 heal a start carries into its PreWake (startHealed),
 	// written alone when the start is not admitted or refuses before it.
 	Heal *intent
+	// Closing is a close's kind and kept assignees (A21).
+	Closing closeSpec
 	// Rests are the fresh facts the decision rests on, which only a fresh
 	// kind's arm records: its effect reads them and decides again on them.
 	Rests rests

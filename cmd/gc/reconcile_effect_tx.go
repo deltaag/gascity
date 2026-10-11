@@ -51,6 +51,7 @@ const (
 	capReadStores                     // the read-only city and rig stores (reads)
 	capProviderStart                  // the start's provider, endpoint breaker and clock (a Call's)
 	capEpisode                        // the #46 startup-health episode record (a Call's)
+	capRelease                        // the close's raw work legs, for its release Call and its around's cascade
 )
 
 // txCaps is what a body, Probe or Call holds: the handles its spec grants,
@@ -69,7 +70,8 @@ type txCaps struct {
 	episode startupHealthRecord // capEpisode
 	// by is the controller, as a Call's leasing helper (a Manager start or
 	// stop) is handed it, carrying the effect's lease (callWatched).
-	by session.Actor
+	by      session.Actor
+	release *closeReleases // capRelease
 }
 
 // startCaps are what the start's Calls hold to admit the endpoint ticket and
@@ -86,10 +88,13 @@ type startCaps struct {
 
 // aroundCaps is what an around holds. It runs outside every lock, so it
 // reaches no write and none of a Call's handles (provider start, routing,
-// release, kill); C5a1's endpoint gate may add Eligible here, never Admit.
+// release, kill), but the close's cascade (capRelease), which writes only
+// after its close landed; C5a1's endpoint gate may add Eligible here, never
+// Admit.
 type aroundCaps struct {
-	it    intent
-	reads effectReads // capReadStores: read-only
+	it      intent
+	reads   effectReads    // capReadStores: read-only
+	release *closeReleases // capRelease
 }
 
 // capsFor is it's txCaps under grant.
@@ -107,6 +112,9 @@ func (p *effectPass) capsFor(it intent, grant caps, latch *writeLatch) txCaps {
 	}
 	if grant&capEpisode != 0 {
 		c.episode = p.held.episode
+	}
+	if grant&capRelease != 0 {
+		c.release = p.held.release
 	}
 	return c
 }
@@ -302,6 +310,10 @@ type section struct {
 	// which the effect lint covers; each set by one write, never read by the
 	// transaction.
 	probeDef, decideDef, callDef any
+	// when, set by calledWhen, decides from the concluded step's Pass
+	// whether the Call runs at all: a skipped Call is no write, so it passes
+	// no gate, opens no latch and runs no seam.
+	when func(pass any) bool
 }
 
 // probed is a section whose Probe, a bounded read under both locks after the
@@ -336,6 +348,9 @@ const (
 	// callStop stops one: the full premise holds after it, a start's
 	// before it included.
 	callStop
+	// callWork writes work beads (a release), not the runtime: the premise
+	// after it is the one before it.
+	callWork
 )
 
 // called is sec with a provider Call after it, run under the name lock with
@@ -352,6 +367,22 @@ func called[In, Out any](kind callKind, sec section, call func(context.Context, 
 		return call(ctx, c, typed)
 	}
 	sec.callDef = call
+	return sec
+}
+
+// calledWhen is called with an opt-in skip: the Call runs only when when
+// accepts the step's Pass (a corpse to remove, a release to make). By
+// default a section's Call always runs, and opens the latch like a write.
+// Both are stored:
+//
+//gc:stored-param call
+//gc:stored-param when
+func calledWhen[In, Out any](kind callKind, sec section, when func(In) bool, call func(context.Context, txCaps, In) (Out, error)) section {
+	sec = called(kind, sec, call)
+	sec.when = func(pass any) bool {
+		typed, ok := pass.(In)
+		return ok && when(typed)
+	}
 	return sec
 }
 
@@ -471,7 +502,7 @@ func runTx(ctx context.Context, p *effectPass, it intent, spec effectSpec, latch
 		return runSpec(ctx, p, it, spec, c)
 	}
 	ran := false
-	return spec.around(ctx, aroundCaps{it: it, reads: c.reads}, func() settlement {
+	return spec.around(ctx, aroundCaps{it: it, reads: c.reads, release: c.release}, func() settlement {
 		if ran {
 			return settlement{Outcome: settledFailed, Cause: causeAroundRun}
 		}
@@ -577,7 +608,7 @@ func (t *tx) run(ctx context.Context, sections []section) settlement {
 		if end {
 			break
 		}
-		if t.view.prev, t.view.prevErr = nil, nil; sec.call == nil {
+		if t.view.prev, t.view.prevErr = nil, nil; sec.call == nil || sec.when != nil && !sec.when(t.pass) {
 			continue
 		}
 		if err := t.c.at(ctx, seamBeforeCall); err != nil {
