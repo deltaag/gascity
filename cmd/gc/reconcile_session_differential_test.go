@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"go/ast"
 	"go/parser"
@@ -85,7 +86,9 @@ type parityFixture struct {
 	// legacy's provider answers it, and v2's observation cache holds the
 	// probe's fact.
 	Pending []string
-	Explain map[string]string
+	// StartErr fails each copy's first provider Start (S3's abandon).
+	StartErr error
+	Explain  map[string]string
 }
 
 // parityRow is a bead; a type alias keeps fixtures short.
@@ -154,6 +157,19 @@ var parityFindings = map[string]parityEntry{
 	// the conversation of a provider without a keyed transcript. v2's
 	// dead-runtime accrual writes that reset (deadRuntimePatch); C5a2's
 	// start failure must write the same ConversationResetPatch(true).
+	"pending-create-swept": {
+		"CONTRACT v5 A10, C3; BEHAVIORS MAINT-051, SESS-050..052", "an undesired pool pending create past its never-started deadline: legacy's MAINT-051 sweep closes it first as gc_swept, its claim keys left on the closed row, so its rollback never runs; v2 does not run the sweep, and A10 rolls it back (failed-create, the claim cleared). §12.2 #17 covers only the orphan close's reason",
+		[]string{"state", "close_reason", "pending_create_claim", "pending_create_started_at"},
+	},
+	"rollback-stops-nothing": {"CONTRACT v5 C3, C8.8; BEHAVIORS SESS-052", "legacy stops a bead-scoped pool name before its rollback whether or not anything runs under it (releaseBeadScopedPoolRuntime); v2 stops only a runtime its fresh read finds, whose absence that read has confirmed. §12.2 does not list it", nil},
+	"rollback-replacement-slot": {
+		"CONTRACT v5 AL1, A10", "v2 creates a rolled-back seat's replacement in the rollback's pass, while the rolled-back row still occupies its slot, so the replacement takes the next slot; legacy closes the row first and creates the replacement the next tick in the freed slot. §12.2 does not list it",
+		[]string{"agent_name", "canonical_instance_name", "canonical_pool_slot", "pool_slot", "prompt_hash"},
+	},
+	"rollback-leaves-lease": {
+		"v5.9b §12.5 (runtime lease); BEHAVIORS START-033", "legacy's failed start rolls its pending create back while it still holds the row's runtime lease record, which stays on the closed row; v2's effect releases its lease record with the close. §12.2 does not list it",
+		[]string{session.RuntimeLeaseExpiresKey, session.RuntimeLeaseFlockKey, session.RuntimeLeaseHolderKey, session.RuntimeLeaseTTLKey},
+	},
 	"mislabelled-close": {"CONTRACT v5 AL1, A1", "legacy closes a row with no template and no session name as orphaned; v2's A1 leaves it open as None, which §12.2 does not list", []string{"status", "state", "close_reason", "closed_at"}},
 }
 
@@ -167,7 +183,6 @@ var parityUnported = map[string]parityEntry{
 	// provider.health_gate_alert). v2's A18 skips a red provider's start
 	// (TestDecideRowStartGates) but keeps no episode and records no alert.
 	// Owner: the C5b follow-up PR, with episode-mirror.
-	"rollback A10":   {"C5a2 (the rollback effect; A10's arm, C5b)", "legacy closes an undesired pending create past its never-started deadline; v2's A10 proposes the rollback once C5a2 registers its effect", []string{"status", "state", "close_reason", "closed_at"}},
 	"A21 close":      {"C5c1 (#7314), C5c1b (#7330)", "legacy closes an unwanted dead row; v2 registers no close arm yet", []string{"status", "state", "close_reason", "closed_at"}},
 	"A21 stranded":   {"C5c1 (#7314)", "legacy stamps the stranded marker of a dead row with assigned work and records session.stranded; v2 registers no close arm yet", []string{"stranded_event_emitted_at"}},
 	"A7 identity":    {"C7d (mc-3lel1)", "legacy's session-bead sync converges a row's identity to its config: the agent label, the pool slot a canonical singleton drops, and an alias the pool does not manage (clearing it, and GC_ALIAS on the runtime); v2 registers no row-metadata arm yet", []string{"alias", "alias_history", "labels", "pool_slot", "agent_name"}},
@@ -209,6 +224,8 @@ var parityKindOwners = map[string]*regexp.Regexp{
 	// PreWake rows; S1's adopt owns no row yet.
 	intentStart: regexp.MustCompile(`\bS1 start\b|\bS1 PreWake\b`),
 	intentAdopt: regexp.MustCompile(`\bS1 adopt\b`),
+	// A10's rollback (C5a2) owns its C3 rows.
+	intentRollback: regexp.MustCompile(`\bA10 \+ C3 rollback\b`),
 }
 
 var parityArmRef = regexp.MustCompile(`\bA(\d{1,2})\b`)
@@ -285,6 +302,7 @@ func (p twinProvider) actions() map[string]int {
 
 // place puts f's runtimes on p, each under its row's session name.
 func (f parityFixture) place(p *simProvider) {
+	p.nextStart = f.StartErr
 	for _, rt := range f.Runtimes {
 		for _, b := range append(slices.Clone(f.Rows), f.Rig...) {
 			if b.ID == rt.id {
@@ -897,6 +915,12 @@ func parityFixtures() []parityFixture {
 			return cfg
 		}
 	}
+	// floor is workerCity(3) with one floor seat.
+	floor := func() *config.City {
+		cfg := workerCity(3)
+		cfg.Agents[0].MinActiveSessions = intPtr(1)
+		return cfg
+	}
 	// explain merges the alive wanted row gc-1's standing findings with more.
 	explain := func(more map[string]string) map[string]string {
 		out := map[string]string{"row:gc-1:*policy": "sleep-policy-keys"}
@@ -1126,12 +1150,36 @@ func parityFixtures() []parityFixture {
 			Rows: []parityRow{poolRow("gc-1", "worker", 1, "asleep", "instance_token", "tok-gc-1", "held_until", at(-time.Hour), "sleep_reason", "user-hold")}, Work: assigned,
 			Explain: started("gc-1", "s-gc-1", "worker-1", nil),
 		},
-		// A10's rollback (C5a2's effect): legacy rolls an undesired pending
-		// create back past its deadline; v2's arm waits for the effect.
+		// A10's rollback (C5a2): an undesired pending create past its
+		// deadline, which legacy's sweep closes first.
 		{
-			Name: "an undesired pending create past its deadline rolls back", Behaviors: []string{"SESS-050", "SESS-051", "SESS-052", "SESS-092", "SESS-093", "SESS-501", "SESS-502", "GUAR-026", "GUAR-028", "INC-021", "MAINT-034"},
+			Name: "an undesired pending create past its deadline closes", Behaviors: []string{"SESS-050", "SESS-051", "SESS-052", "SESS-501", "MAINT-034"},
 			Rows:    []parityRow{poolRow("gc-1", "worker", 1, "creating", "instance_token", "tok-gc-1", "pending_create_claim", "true", "pending_create_started_at", at(-11*time.Minute))},
-			Explain: map[string]string{"row:gc-1:*rollback": "rollback A10", "row:gc-1:*sync": "A7 row-metadata"},
+			Explain: map[string]string{"row:gc-1:*swept": "pending-create-swept"},
+		},
+		// S3's abandon: a pending create whose start fails rolls back and
+		// accrues #46 (the episode is a bead both copies compare). A seat's
+		// failure retries the next legacy tick but backs off in v2 (P4), so
+		// its classes are pinned against legacy's writers instead
+		// (TestAbandonMatchesLegacyPatches).
+		{
+			Name: "a pending create whose start fails rolls back", Behaviors: []string{"START-031", "START-033"},
+			City: floor, StartErr: errors.New("boom"),
+			Rows: []parityRow{poolRow("gc-1", "worker", 1, "creating", "instance_token", "tok-gc-1", "pending_create_claim", "true", "pending_create_started_at", at(-time.Minute))},
+			Explain: started("gc-3", "worker-gc-3", "", map[string]string{
+				"row:gc-1:*policy": "sleep-policy-keys", "row:gc-1:*lease": "rollback-leaves-lease", "provider:Stop s-gc-1": "rollback-stops-nothing", "row:gc-3:*sync": "A7 row-metadata",
+			}),
+		},
+		// A desired one (a floor seat), which no sweep reaches: both roll
+		// it back, then replace it.
+		{
+			Name: "a desired pending create past its deadline rolls back", Behaviors: []string{"SESS-092", "SESS-093", "SESS-502", "GUAR-026", "GUAR-028", "INC-021"},
+			City: floor,
+			Rows: []parityRow{poolRow("gc-1", "worker", 1, "creating", "instance_token", "tok-gc-1", "pending_create_claim", "true", "pending_create_started_at", at(-11*time.Minute))},
+			Explain: started("gc-2", "worker-gc-2", "", map[string]string{
+				"row:gc-2:*sync": "A7 row-metadata", "row:gc-2:*slot": "rollback-replacement-slot", "provider:Stop s-gc-1": "rollback-stops-nothing",
+				"event:session.woke worker-1 []": "rollback-replacement-slot", "event:session.woke worker-2 []": "rollback-replacement-slot",
+			}),
 		},
 	}
 }
