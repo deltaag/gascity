@@ -111,7 +111,7 @@ func TestACPPermissionThroughPendingRespondAndStream(t *testing.T) {
 		}
 	}
 
-	if _, err := mgr.Send(context.Background(), info.ID, "do it", "", runtime.Config{}, session.ResumeOperator); err != nil {
+	if _, err := mgr.Send(context.Background(), testOperatorIn(t, fs.cityPath), info.ID, "do it", "", runtime.Config{}); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
 	body := pollUntil("event: pending\n")

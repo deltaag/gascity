@@ -96,7 +96,7 @@ func TestACPPermissionRoundTripThroughManager(t *testing.T) {
 		t.Fatalf("Pending before prompt = %#v, %v, %v; want nil, true, nil", pending, supported, err)
 	}
 
-	if _, err := mgr.Send(context.Background(), info.ID, "do it", "", runtime.Config{}, ResumeOperator); err != nil {
+	if _, err := mgr.Send(context.Background(), testActor(mgr, ActorOperator), info.ID, "do it", "", runtime.Config{}); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
 	waitForACPFact(t, "the permission request", func() bool {
@@ -111,7 +111,7 @@ func TestACPPermissionRoundTripThroughManager(t *testing.T) {
 		t.Fatalf("Pending = %#v, want an acp-<nonce>-7 approval for the tool call", pending)
 	}
 
-	if _, err := mgr.Send(context.Background(), info.ID, "another", "", runtime.Config{}, ResumeOperator); !errors.Is(err, ErrPendingInteraction) {
+	if _, err := mgr.Send(context.Background(), testActor(mgr, ActorOperator), info.ID, "another", "", runtime.Config{}); !errors.Is(err, ErrPendingInteraction) {
 		t.Fatalf("Send while pending = %v, want ErrPendingInteraction", err)
 	}
 	err = mgr.Respond(info.ID, runtime.InteractionResponse{RequestID: pending.RequestID, Action: "approve_always"})
@@ -223,7 +223,7 @@ func startACPLatePermissionSession(t *testing.T) *acpLatePermissionSession {
 	t.Cleanup(func() { _ = sp.Stop(info.SessionName) })
 	s.id = info.ID
 	// The first prompt keeps the turn busy until the agent is told to ask.
-	if _, err := s.mgr.Send(context.Background(), s.id, "start", "", runtime.Config{}, ResumeOperator); err != nil {
+	if _, err := s.mgr.Send(context.Background(), testActor(s.mgr, ActorOperator), s.id, "start", "", runtime.Config{}); err != nil {
 		t.Fatalf("first Send: %v", err)
 	}
 	return s
@@ -295,7 +295,7 @@ func TestACPSubmitWaitingForIdleRefusedWhenPermissionArrives(t *testing.T) {
 	result := make(chan error, 1)
 	start := time.Now()
 	go func() {
-		_, err := s.mgr.Send(context.Background(), s.id, "queued", "", runtime.Config{}, ResumeOperator)
+		_, err := s.mgr.Send(context.Background(), testActor(s.mgr, ActorOperator), s.id, "queued", "", runtime.Config{})
 		result <- err
 	}()
 	waitForACPFact(t, "the second submit to hold the session lock", func() bool {
