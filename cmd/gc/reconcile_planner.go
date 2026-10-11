@@ -24,8 +24,8 @@ import (
 // plannerMinGap is the shortest time from one pass's start to the next's.
 const plannerMinGap = 250 * time.Millisecond
 
-// plannerPaceFactor spaces pass starts at this many times the last pass's
-// duration, which keeps the duty cycle near 1/plannerPaceFactor.
+// plannerPaceFactor spaces pass starts at this many times the pace duration
+// (paceGap), which keeps the duty cycle near 1/plannerPaceFactor.
 const plannerPaceFactor = 4
 
 // passFunc runs one pass at now. C2c1 supplies gather, allocate, decideRow
@@ -140,7 +140,10 @@ type planner struct {
 	fairSeed uint64 // admission's fair-share rotation (P4)
 	boot     bootState
 	last     passRecord
-	rowTrace map[rowKey]string // each row's last traced (reason, outcome)
+	// prevDuration is the duration of the pass before last, zero before a
+	// second pass; paceGap paces on the shorter of the two.
+	prevDuration time.Duration
+	rowTrace     map[rowKey]string // each row's last traced (reason, outcome)
 	// idleProbes are the idle begins submitted to prove an agent idle, by
 	// row, which paceIdleProbes holds a patrol apart.
 	idleProbes map[rowKey]idleProbe
@@ -235,8 +238,7 @@ func (p *planner) startsPaused() bool { return p.paused.Load() }
 // a dirty mark, the patrol interval after the last pass ends (bounding a lost
 // wake, R-6), or the last pass's earliest row deadline. One timer serves the
 // patrol, the row deadline and the pacing wait. An owed pass starts at once
-// if the planner is idle; otherwise it waits until max(plannerMinGap,
-// plannerPaceFactor × last duration) after the last start.
+// if the planner is idle; otherwise it waits paceGap after the last start.
 func (p *planner) run(ctx context.Context) {
 	p.running.Store(true)
 	defer close(p.done)
@@ -251,7 +253,7 @@ func (p *planner) run(ctx context.Context) {
 		now := p.clock.Now()
 		wakeAt := due
 		if owed {
-			wakeAt = p.last.Start.Add(max(plannerMinGap, plannerPaceFactor*p.last.Duration))
+			wakeAt = p.last.Start.Add(p.paceGap())
 			if !now.Before(wakeAt) {
 				owed = false
 				res := p.runPass(now)
@@ -279,6 +281,20 @@ func (p *planner) run(ctx context.Context) {
 	}
 }
 
+// paceGap is the wait from the last pass's start to an owed pass's:
+// plannerPaceFactor times the shorter of the last two passes' durations (the
+// last alone before a second pass), so one stretched pass (a process pause, a
+// stalled store read) does not scale it, at least plannerMinGap and at most
+// the patrol interval, so an owed pass is never later than the patrol would
+// have run it. A 101s freeze once bought a 404s stall (staging J40 C).
+func (p *planner) paceGap() time.Duration {
+	pace := p.last.Duration
+	if p.prevDuration > 0 && p.prevDuration < pace {
+		pace = p.prevDuration
+	}
+	return max(plannerMinGap, min(plannerPaceFactor*pace, p.patrol()))
+}
+
 // runPass applies the settlements posted since the last pass
 // (drainSettlements), then runs the pass. A panic in either is recovered in
 // safeTick's style: the pass is skipped and logged, a follow-up pass is
@@ -293,6 +309,9 @@ func (p *planner) runPass(now time.Time) (res passResult) {
 			if !p.last.Panicked {
 				p.alert(alertPassPanic, "", fmt.Sprintf("pass panicked: %v", r))
 			}
+		}
+		if !p.last.Start.IsZero() {
+			p.prevDuration = p.last.Duration
 		}
 		p.last = passRecord{Start: now, Duration: p.clock.Now().Sub(now), Panicked: r != nil, Result: res}
 		p.metrics.recordPass(now, p.last.Duration, r != nil, res.Counts)

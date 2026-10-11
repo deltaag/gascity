@@ -676,3 +676,53 @@ func TestPlannerStampsZeroSettlementAt(t *testing.T) {
 		t.Fatalf("settled = %+v, want the zero At stamped %v and the effect's own At kept", got, plannerT0)
 	}
 }
+
+// TestPlannerPacingIgnoresOneStretchedPass: a pass stretched by a process
+// pause or a stalled read (staging J40 C: a 101s freeze bought a 404s stall,
+// the patrol included) does not scale the wait. After a normal pass, the
+// owed pass waits four times the shorter of the last two passes; with no
+// history, at most the patrol interval.
+//
+// Kills: pacing on the last pass alone, and an uncapped pacing wait.
+func TestPlannerPacingIgnoresOneStretchedPass(t *testing.T) {
+	t.Run("after a normal pass", func(t *testing.T) {
+		passes := 0
+		h := newPlannerHarness(t, func(h *plannerHarness, _ time.Time) passResult {
+			switch passes++; passes {
+			case 1:
+				h.clk.Advance(time.Second)
+				h.p.markDirty("test")
+			case 2:
+				h.clk.Advance(101 * time.Second) // frozen mid-pass
+				h.p.markDirty("test")
+			}
+			return passResult{}
+		})
+		h.patrol.Store(int64(time.Hour)) // no cap in play: the pacing rule alone
+		h.start(t)
+		h.p.markDirty("test")
+		h.expectPass(t, plannerT0)
+		second := plannerT0.Add(4 * time.Second) // 4 × the 1s pass
+		h.clk.waitArmed(t, second)
+		h.clk.Advance(3 * time.Second)
+		h.expectPass(t, second)
+		third := second.Add(101 * time.Second) // 4 × min(1s, 101s): due at the thaw, at once
+		h.expectPass(t, third)
+	})
+	t.Run("capped at the patrol", func(t *testing.T) {
+		first := true
+		h := newPlannerHarness(t, func(h *plannerHarness, _ time.Time) passResult {
+			if first {
+				first = false
+				h.clk.Advance(101 * time.Second)
+				h.p.markDirty("test")
+			}
+			return passResult{}
+		})
+		h.start(t)
+		h.p.markDirty("test")
+		h.expectPass(t, plannerT0)
+		next := plannerT0.Add(101 * time.Second) // past the 15s patrol cap: at once
+		h.expectPass(t, next)
+	})
+}
