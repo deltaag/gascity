@@ -3,6 +3,8 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/BurntSushi/toml"
@@ -283,15 +285,25 @@ func TestPersistSiteBindingKeepsEmptyUnknownTable(t *testing.T) {
 	}
 }
 
-// TestPersistSiteBindingRoundTripIsIdempotent verifies a no-op rewrite of a
-// file carrying unknown content leaves it stable across repeated writes.
+// TestPersistSiteBindingRoundTripIsIdempotent verifies the first rewrite of
+// a file carrying unknown content preserves it, and a repeated identical
+// rewrite leaves the file untouched on disk.
 func TestPersistSiteBindingRoundTripIsIdempotent(t *testing.T) {
 	cityDir, _ := writeRoundTripCity(t)
 	rigs := []Rig{{Name: "alpha", Path: "/srv/alpha"}}
 	if err := PersistRigSiteBindings(fsys.OSFS{}, cityDir, rigs); err != nil {
 		t.Fatalf("first PersistRigSiteBindings: %v", err)
 	}
+	raw := decodeSiteTomlRaw(t, cityDir)
+	assertUnknownSiteContentPreserved(t, raw)
+	if got := siteRigEntries(raw)["alpha"]["pinned"]; got != true {
+		t.Fatalf("rig alpha pinned = %#v after first write, want true", got)
+	}
 	first, err := os.ReadFile(SiteBindingPath(cityDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstInfo, err := os.Stat(SiteBindingPath(cityDir))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -302,7 +314,247 @@ func TestPersistSiteBindingRoundTripIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	secondInfo, err := os.Stat(SiteBindingPath(cityDir))
+	if err != nil {
+		t.Fatal(err)
+	}
 	if string(first) != string(second) {
 		t.Fatalf("repeated rewrite changed site.toml:\nfirst:\n%s\nsecond:\n%s", first, second)
+	}
+	if !os.SameFile(firstInfo, secondInfo) {
+		t.Fatalf("repeated identical rewrite replaced site.toml; want the write skipped")
+	}
+}
+
+func seedSiteToml(t *testing.T, content string) string {
+	t.Helper()
+	cityDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(cityDir, ".gc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(SiteBindingPath(cityDir), []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return cityDir
+}
+
+// siteRigEntryList returns every [[rig]] entry in document order.
+func siteRigEntryList(t *testing.T, raw map[string]any) []map[string]any {
+	t.Helper()
+	switch rigs := raw["rig"].(type) {
+	case nil:
+		return nil
+	case []map[string]any:
+		return rigs
+	default:
+		t.Fatalf("rig = %#v (%T), want array of tables", raw["rig"], raw["rig"])
+		return nil
+	}
+}
+
+func findSiteRigEntry(entries []map[string]any, name, path string) map[string]any {
+	for _, entry := range entries {
+		if entry["name"] == name && entry["path"] == path {
+			return entry
+		}
+	}
+	return nil
+}
+
+// TestSiteBindingWritersPreservePerRigKeys pins the per-rig key policy for
+// every rig-entry shape TOML and LoadSiteBinding accept.
+func TestSiteBindingWritersPreservePerRigKeys(t *testing.T) {
+	persistRigs := func(rigs ...Rig) func(t *testing.T, cityDir string) {
+		return func(t *testing.T, cityDir string) {
+			t.Helper()
+			if err := PersistRigSiteBindings(fsys.OSFS{}, cityDir, rigs); err != nil {
+				t.Fatalf("PersistRigSiteBindings: %v", err)
+			}
+		}
+	}
+	persistWorkspace := func(t *testing.T, cityDir string) {
+		t.Helper()
+		if err := PersistWorkspaceSiteBinding(fsys.OSFS{}, cityDir, "acme", "ac"); err != nil {
+			t.Fatalf("PersistWorkspaceSiteBinding: %v", err)
+		}
+	}
+	type wantEntry struct {
+		name, path string // path "" means the entry must carry no path key
+		key        string
+		value      any
+	}
+	cases := []struct {
+		name    string
+		seed    string
+		write   func(t *testing.T, cityDir string)
+		want    []wantEntry
+		wantLen int
+	}{
+		{
+			name:    "inline array via rig writer",
+			seed:    `rig = [{name = "alpha", path = "/srv/alpha", pinned = true}]`,
+			write:   persistRigs(Rig{Name: "alpha", Path: "/srv/alpha"}),
+			want:    []wantEntry{{"alpha", "/srv/alpha", "pinned", true}},
+			wantLen: 1,
+		},
+		{
+			name:    "inline array via workspace writer",
+			seed:    `rig = [{name = "alpha", path = "/srv/alpha", pinned = true}]`,
+			write:   persistWorkspace,
+			want:    []wantEntry{{"alpha", "/srv/alpha", "pinned", true}},
+			wantLen: 1,
+		},
+		{
+			name:    "padded name via workspace writer",
+			seed:    "[[rig]]\nname = \" alpha \"\npath = \"/srv/alpha\"\npinned = true\n",
+			write:   persistWorkspace,
+			want:    []wantEntry{{" alpha ", "/srv/alpha", "pinned", true}},
+			wantLen: 1,
+		},
+		{
+			name:    "padded name via rig writer",
+			seed:    "[[rig]]\nname = \" alpha \"\npath = \"/srv/alpha\"\npinned = true\n",
+			write:   persistRigs(Rig{Name: "alpha", Path: "/srv/alpha"}),
+			want:    []wantEntry{{"alpha", "/srv/alpha", "pinned", true}},
+			wantLen: 1,
+		},
+		{
+			name: "duplicate orphan names keep their own keys",
+			seed: "[[rig]]\nname = \"orphan\"\npath = \"/b\"\nk_b = true\n\n" +
+				"[[rig]]\nname = \"orphan\"\npath = \"/a\"\nk_a = true\n",
+			write: persistRigs(),
+			want: []wantEntry{
+				{"orphan", "/a", "k_a", true},
+				{"orphan", "/b", "k_b", true},
+			},
+			wantLen: 2,
+		},
+		{
+			name: "path-less entry with keys survives rig writer",
+			seed: "[[rig]]\nname = \"alpha\"\npath = \"/srv/alpha\"\n\n" +
+				"[[rig]]\nname = \"beta\"\nstorage_binding = \"remote\"\n",
+			write: persistRigs(Rig{Name: "alpha", Path: "/srv/alpha"}),
+			want: []wantEntry{
+				{"alpha", "/srv/alpha", "", nil},
+				{"beta", "", "storage_binding", "remote"},
+			},
+			wantLen: 2,
+		},
+		{
+			name: "declared but unbound rig keeps its keys without a path",
+			seed: "[[rig]]\nname = \"alpha\"\npath = \"/srv/alpha\"\n\n" +
+				"[[rig]]\nname = \"beta\"\npath = \"/srv/beta\"\nstorage_binding = \"remote\"\n",
+			write: persistRigs(Rig{Name: "alpha", Path: "/srv/alpha"}, Rig{Name: "beta"}),
+			want: []wantEntry{
+				{"alpha", "/srv/alpha", "", nil},
+				{"beta", "", "storage_binding", "remote"},
+			},
+			wantLen: 2,
+		},
+		{
+			name:    "rebind to a new path carries per-rig keys",
+			seed:    "[[rig]]\nname = \"alpha\"\npath = \"/old\"\nworkdir_id = \"w1\"\n",
+			write:   persistRigs(Rig{Name: "alpha", Path: "/new"}),
+			want:    []wantEntry{{"alpha", "/new", "workdir_id", "w1"}},
+			wantLen: 1,
+		},
+		{
+			name:    "path-less entry without extra keys is dropped by rig writer",
+			seed:    "[[rig]]\nname = \"alpha\"\npath = \"/srv/alpha\"\n\n[[rig]]\nname = \"beta\"\n",
+			write:   persistRigs(Rig{Name: "alpha", Path: "/srv/alpha"}),
+			want:    []wantEntry{{"alpha", "/srv/alpha", "", nil}},
+			wantLen: 1,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cityDir := seedSiteToml(t, tc.seed)
+			tc.write(t, cityDir)
+			raw := decodeSiteTomlRaw(t, cityDir)
+			entries := siteRigEntryList(t, raw)
+			if len(entries) != tc.wantLen {
+				t.Fatalf("rig entries = %#v, want %d", entries, tc.wantLen)
+			}
+			for _, want := range tc.want {
+				var entry map[string]any
+				if want.path == "" {
+					for _, e := range entries {
+						if _, hasPath := e["path"]; e["name"] == want.name && !hasPath {
+							entry = e
+						}
+					}
+				} else {
+					entry = findSiteRigEntry(entries, want.name, want.path)
+				}
+				if entry == nil {
+					t.Fatalf("no rig entry name=%q path=%q; entries = %#v", want.name, want.path, entries)
+				}
+				if want.key != "" && entry[want.key] != want.value {
+					t.Errorf("rig %q@%q %s = %#v, want %#v; entries = %#v",
+						want.name, want.path, want.key, entry[want.key], want.value, entries)
+				}
+			}
+		})
+	}
+}
+
+// TestPersistRigSiteBindingsDropsRemovedPathlessEntry verifies explicit rig
+// removal drops the entry with its per-rig keys even when it has no path.
+func TestPersistRigSiteBindingsDropsRemovedPathlessEntry(t *testing.T) {
+	cityDir := seedSiteToml(t, "workspace_name = \"acme\"\n\n[[rig]]\nname = \"beta\"\nstorage_binding = \"remote\"\n")
+	if err := persistRigSiteBindings(fsys.OSFS{}, cityDir, nil, rigNameSet([]string{"beta"})); err != nil {
+		t.Fatalf("persistRigSiteBindings: %v", err)
+	}
+	raw := decodeSiteTomlRaw(t, cityDir)
+	if _, ok := raw["rig"]; ok {
+		t.Fatalf("removed rig entry survived; site.toml = %#v", raw)
+	}
+}
+
+// TestPersistSiteBindingPreservesFileMode verifies a rewrite keeps the
+// operator's permission bits instead of forcing 0644.
+func TestPersistSiteBindingPreservesFileMode(t *testing.T) {
+	cityDir := seedSiteToml(t, siteTomlWithUnknownContent)
+	if err := os.Chmod(SiteBindingPath(cityDir), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := PersistWorkspaceSiteBinding(fsys.OSFS{}, cityDir, "renamed", "rn"); err != nil {
+		t.Fatalf("PersistWorkspaceSiteBinding: %v", err)
+	}
+	info, err := os.Stat(SiteBindingPath(cityDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("site.toml mode = %v, want 0600", got)
+	}
+}
+
+// TestSiteBindingFieldsHaveWriterOwner fails when a SiteBinding or
+// RigSiteBinding field is added without registering which persistSiteBinding
+// writer owns its TOML key. Each writer patches only the keys it owns, so an
+// unowned field would be silently never written.
+func TestSiteBindingFieldsHaveWriterOwner(t *testing.T) {
+	for _, tc := range []struct {
+		typ    reflect.Type
+		owners map[string]string
+	}{
+		{reflect.TypeOf(SiteBinding{}), siteBindingKeyOwners},
+		{reflect.TypeOf(RigSiteBinding{}), rigSiteBindingKeyOwners},
+	} {
+		tags := map[string]bool{}
+		for i := 0; i < tc.typ.NumField(); i++ {
+			tag := strings.Split(tc.typ.Field(i).Tag.Get("toml"), ",")[0]
+			tags[tag] = true
+			if _, ok := tc.owners[tag]; !ok {
+				t.Errorf("%s field %s (toml %q) has no writer owner; add it to the owners map and patch it in that writer",
+					tc.typ.Name(), tc.typ.Field(i).Name, tag)
+			}
+		}
+		for key := range tc.owners {
+			if !tags[key] {
+				t.Errorf("%s owners map lists %q, which is not a field toml tag", tc.typ.Name(), key)
+			}
+		}
 	}
 }
