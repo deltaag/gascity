@@ -199,6 +199,8 @@ var rowArms = []rowArm{
 	{"A8", armBaseline},
 	{"A9", armLivenessUnknown},
 	{"A10", armAdopt},
+	{"A14", armConfigDrift},
+	{"A16", armExecutionStalled},
 	{"A17", armHeartbeatRespawn},
 	{"A18", armStart},
 	{"A19", armDrainVoidCancel},
