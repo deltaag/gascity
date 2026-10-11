@@ -3,11 +3,13 @@ package supervisor
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/gastownhall/gascity/internal/loopbackport"
 )
 
 func TestLoadConfigMissing(t *testing.T) {
@@ -414,11 +416,16 @@ func TestRegistryRegisterPanicsOnHostPath(t *testing.T) {
 }
 
 // The seeded port is outside the kernel's ephemeral range, so no bind(":0")
-// or outgoing connect of another process on the host is ever handed it, and
-// two isolated homes seeded at once get different ports. A listen-then-close
-// reservation on ":0" let concurrent isolated supervisors seed the same port
-// and the loser exit on "address already in use" (ga-96smfk.87).
+// or outgoing connect in the network namespace is handed it, and on Linux,
+// where ports are leased, two isolated homes seeded at once get different
+// ports. A listen-then-close reservation on ":0" let concurrent isolated
+// supervisors seed the same port and the loser exit on "address already in
+// use" (ga-96smfk.87).
 func TestLoadConfigSeedsAPortOutsideTheEphemeralRange(t *testing.T) {
+	lo, hi := loopbackport.EphemeralPortRange()
+	if lo <= 10000 && hi == 65535 {
+		t.Skipf("the kernel's ephemeral range [%d, %d] covers every port from 10000 up, where loopbackport.Reserve draws", lo, hi)
+	}
 	seen := map[int]bool{}
 	for i := 0; i < 20; i++ {
 		t.Setenv("GC_HOME", t.TempDir())
@@ -427,30 +434,14 @@ func TestLoadConfigSeedsAPortOutsideTheEphemeralRange(t *testing.T) {
 			t.Fatal(err)
 		}
 		port := cfg.Supervisor.Port
-		if port >= supervisorEphemeralPortFloor() {
-			t.Fatalf("seeded port %d is in the kernel's ephemeral range (from %d)", port, supervisorEphemeralPortFloor())
+		if port >= lo && port <= hi {
+			t.Fatalf("seeded port %d is in the kernel's ephemeral range [%d, %d]", port, lo, hi)
 		}
-		if seen[port] {
+		// Ports are leased only on Linux (loopbackport), so elsewhere two homes
+		// seeded in one process can be handed the same port.
+		if runtime.GOOS == "linux" && seen[port] {
 			t.Fatalf("seeded port %d twice", port)
 		}
 		seen[port] = true
 	}
-}
-
-// supervisorEphemeralPortFloor is the lower bound of the kernel's ephemeral
-// port range (the Linux default where it cannot be read).
-func supervisorEphemeralPortFloor() int {
-	data, err := os.ReadFile("/proc/sys/net/ipv4/ip_local_port_range")
-	if err != nil {
-		return 32768
-	}
-	fields := strings.Fields(string(data))
-	if len(fields) == 0 {
-		return 32768
-	}
-	lo, err := strconv.Atoi(fields[0])
-	if err != nil {
-		return 32768
-	}
-	return lo
 }

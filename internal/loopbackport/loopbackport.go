@@ -18,12 +18,19 @@ import (
 // registered well-known services a host may run.
 const reservedPortRangeStart = 10000
 
+// maxPort is the highest TCP port.
+const maxPort = 65535
+
 // defaultEphemeralPortRangeStart is the Linux default lower bound of
 // net.ipv4.ip_local_port_range, used where the live value cannot be read.
 const defaultEphemeralPortRangeStart = 32768
 
 // reservePortAttempts bounds the random probes before giving up.
 const reservePortAttempts = 256
+
+// ephemeralPortRangePath holds the kernel's ephemeral port range on Linux.
+// Tests point it at a file of their own.
+var ephemeralPortRangePath = "/proc/sys/net/ipv4/ip_local_port_range"
 
 var (
 	portLeasesMu sync.Mutex
@@ -46,27 +53,72 @@ var (
 // on "address already in use" while the other held it (ga-96smfk.45,
 // ga-vnycm2.15, ga-96smfk.87).
 //
-// So the port comes from below the kernel's ephemeral range, which bind(":0")
-// and connect draw from, and on Linux is leased under a name scoped to the
-// network namespace (an abstract socket) that this process holds until it
-// exits: another caller, in this or any other process, skips a leased port.
-// The kernel drops the lease with the process, so nothing goes stale. A port
-// that something else has bound is skipped too, which covers a server child
-// that outlives the test binary that leased its port.
+// So the port comes from outside the kernel's ephemeral range, which
+// bind(":0") and connect draw from: from the larger of the bands from 10000
+// up that lie below and above it (reservableRange). On Linux it is leased
+// under a name scoped to the network namespace (an abstract socket) that this
+// process holds until it exits: another caller, in this or any other process,
+// skips a leased port. The kernel drops the lease with the process, so
+// nothing goes stale. A port that something else has bound is skipped too,
+// which covers a server child that outlives the process that leased its port.
 //
 // Two gaps remain. Other platforms have no namespace-scoped name to lease, so
 // there a reservation rests on the range and the bound-port skip alone
-// (portLeasesEnforced). And where the live ephemeral range cannot be read or
-// starts at or below reservedPortRangeStart, the range ends at the Linux
-// default floor instead and may overlap the ephemeral range, leaving the lease
-// and the bound-port skip as the only protection.
+// (portLeasesEnforced). And where the ephemeral range covers every port from
+// 10000 up (a host that widened it to 1024-65535), no port lies outside it:
+// the port comes from [10000, 32767] instead, and the lease and the
+// bound-port skip are the only protection.
 func Reserve() (int, error) {
-	return reserveIn(reservedPortRangeStart, ephemeralPortRangeStart()-1)
+	lo, hi, _ := reservableRange(EphemeralPortRange())
+	return reserveIn(lo, hi)
+}
+
+// EphemeralPortRange returns the kernel's ephemeral port range, inclusive:
+// the ports bind(":0") and outgoing connects are handed
+// (net.ipv4.ip_local_port_range). Where that cannot be read, it is
+// [32768, 65535], which covers the Linux default and the macOS range
+// (49152-65535).
+func EphemeralPortRange() (lo, hi int) {
+	data, err := os.ReadFile(ephemeralPortRangePath)
+	if err != nil {
+		return defaultEphemeralPortRangeStart, maxPort
+	}
+	fields := strings.Fields(string(data))
+	if len(fields) != 2 {
+		return defaultEphemeralPortRangeStart, maxPort
+	}
+	lo, errLo := strconv.Atoi(fields[0])
+	hi, errHi := strconv.Atoi(fields[1])
+	if errLo != nil || errHi != nil || lo < 1 || hi > maxPort || lo > hi {
+		return defaultEphemeralPortRangeStart, maxPort
+	}
+	return lo, hi
+}
+
+// reservableRange returns the band Reserve draws from, given the kernel's
+// ephemeral range [lo, hi]: the larger of the bands from
+// reservedPortRangeStart up that lie below and above it, so that no
+// bind(":0") or connect is handed the port. outside is false where the
+// ephemeral range covers every port from reservedPortRangeStart up; the band
+// is then [reservedPortRangeStart, defaultEphemeralPortRangeStart-1], inside
+// the range.
+func reservableRange(lo, hi int) (bandLo, bandHi int, outside bool) {
+	aboveLo := max(hi+1, reservedPortRangeStart)
+	below := lo - reservedPortRangeStart
+	above := maxPort - aboveLo + 1
+	switch {
+	case below <= 0 && above <= 0:
+		return reservedPortRangeStart, defaultEphemeralPortRangeStart - 1, false
+	case below >= above:
+		return reservedPortRangeStart, lo - 1, true
+	default:
+		return aboveLo, maxPort, true
+	}
 }
 
 // reserveIn is Reserve over the inclusive range [lo, hi].
 func reserveIn(lo, hi int) (int, error) {
-	if lo < 1 || hi > 65535 || hi < lo {
+	if lo < 1 || hi > maxPort || hi < lo {
 		return 0, fmt.Errorf("reserving a loopback port: empty range [%d, %d]", lo, hi)
 	}
 	span := hi - lo + 1
@@ -120,24 +172,6 @@ func reserveIn(lo, hi int) (int, error) {
 // stand in for that holder.
 var listenLoopbackProbe = func(port int) (net.Listener, error) {
 	return net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
-}
-
-// ephemeralPortRangeStart returns the lower bound of the kernel's ephemeral
-// port range.
-func ephemeralPortRangeStart() int {
-	data, err := os.ReadFile("/proc/sys/net/ipv4/ip_local_port_range")
-	if err != nil {
-		return defaultEphemeralPortRangeStart
-	}
-	fields := strings.Fields(string(data))
-	if len(fields) == 0 {
-		return defaultEphemeralPortRangeStart
-	}
-	lo, err := strconv.Atoi(fields[0])
-	if err != nil || lo <= reservedPortRangeStart {
-		return defaultEphemeralPortRangeStart
-	}
-	return lo
 }
 
 func gcd(a, b int) int {

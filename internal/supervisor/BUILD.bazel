@@ -52,6 +52,7 @@ go_test(
     deps = [
         "//internal/config",
         "//internal/events",
+        "//internal/loopbackport",
         "//internal/mail",
         "//internal/testenv",
         "//internal/testutil",

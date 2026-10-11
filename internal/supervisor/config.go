@@ -304,9 +304,9 @@ func PublicationsPath(cityPath string) string {
 
 // seedIsolatedSupervisorConfig writes a private supervisor.toml for an
 // isolated GC_HOME (a test binary, or GC_ISOLATED=1). Its API port comes from
-// loopbackport.Reserve: outside the kernel's ephemeral range and leased
-// host-wide, so concurrent isolated homes are not seeded the same port
-// (ga-96smfk.87).
+// loopbackport.Reserve: outside the kernel's ephemeral range where a band is
+// free above 10000 and, on Linux, leased netns-wide, so concurrent isolated
+// homes are not seeded the same port (ga-96smfk.87).
 func seedIsolatedSupervisorConfig(path string) (bool, error) {
 	if !shouldSeedIsolatedSupervisorConfig(path) {
 		return false, nil
