@@ -50,6 +50,7 @@ type plannerHost struct {
 	safeTick         func(fn func(), trigger string) (panicked bool)
 	rec              events.Recorder
 	stderr           io.Writer
+	stranded         *strandedClaimAlerts // the controller's (strandedClaimAlerter)
 }
 
 // plannerRuntime owns the planner and what runs beside it. mu orders
@@ -213,6 +214,7 @@ func (rt *plannerRuntime) start(parent context.Context) bool {
 	rt.cancel = cancel
 	h := rt.host
 	lane := newExternalReadsLane(rt.env.Load().patrol(), h.gather.externalReadsEnv, func() { rt.planner.markDirty("external-reads") }, h.safeTick, h.rec, h.stderr)
+	lane.stranded = h.stranded
 	lane.addWaitsStep()
 	lane.addPoolSteps(rt.planner.out.summary.Load, rt.planner.postExecutionStalled)
 	rt.lane.Store(lane)

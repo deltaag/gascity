@@ -1598,3 +1598,19 @@ func TestPlannerDoesNotReferenceCityRuntime(t *testing.T) {
 		t.Fatalf("planner code must reach the city only through plannerHost and the published env (F2):\n  %s", strings.Join(bad, "\n  "))
 	}
 }
+
+// Kills the v2 stranded-work detector never running: the controller's one
+// alerter reaches the planner host, and the started lane's orphan-release
+// step holds it (D25, D26).
+func TestV2LaneHoldsTheControllersStrandedAlerter(t *testing.T) {
+	cr, _ := newPhaseFixtureRuntime(t, false, false)
+	rt := attachTestV2(t, cr)
+	if rt.host.stranded == nil || rt.host.stranded != cr.strandedClaimAlerter() {
+		t.Fatalf("host alerter = %p, want the controller's %p", rt.host.stranded, cr.strandedClaimAlerter())
+	}
+	rt.publishEnv()
+	rt.start(context.Background())
+	if lane := rt.lane.Load(); lane == nil || lane.stranded != cr.strandedClaimAlerter() {
+		t.Fatal("the started lane does not hold the controller's alerter")
+	}
+}
