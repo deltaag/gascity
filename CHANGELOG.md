@@ -211,7 +211,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stays awake, its idle window starts at detach, and an attach overrides an
   idle drain the reconciler had already begun. A user hold or another explicit
   sleep request still wins over the attachment. Both the legacy reconciler and
-  the v2 allocator apply the rule (follow-up to #7533).
+  the v2 allocator apply the rule (#7594, follow-up to #7533).
 
 - **A new scope directory over an existing current-era managed Dolt database
   initializes instead of being refused as a legacy Dolt server workspace.**
