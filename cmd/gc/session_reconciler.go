@@ -1627,15 +1627,9 @@ func wakeDemandOverridesSleepSuppression(
 	policy resolvedSessionSleepPolicy,
 	poolDesired map[string]int,
 	template string,
-	hasExplicitSleepIntent bool,
+	sleepIntent string,
 	explicitWake bool,
 ) bool {
-	if hasExplicitSleepIntent {
-		return false
-	}
-	if eval.HasAssignedWork || explicitWake {
-		return true
-	}
 	// A terminal attached to the session (or an attach probe that could not
 	// tell, which reads as attached) holds it awake for every sleep class:
 	// the idle window starts at detach (detached_at), and the pane's last
@@ -1644,7 +1638,20 @@ func wakeDemandOverridesSleepSuppression(
 	// wake and drained the session under its user. ComputeAwakeSet already
 	// keeps attached sessions out of its own idle-sleep; this is the same
 	// rule for the sleep-policy suppression layered on top of it.
-	if decision.Reason == "attached" || containsWakeReason(eval.Reasons, WakeAttached) {
+	attached := decision.Reason == "attached" || containsWakeReason(eval.Reasons, WakeAttached)
+	// The reconciler's own idle-stop-pending marker is not a sleep request
+	// from anyone: it records an idle verdict that an attach since (or a
+	// single false "not attached" read at the window's edge) has overtaken.
+	// Let the attachment win over it, so the awake path cancels the idle
+	// drain and clears the marker. Any other sleep intent (user-hold, a
+	// session's own request) still wins over the attachment.
+	if sleepIntent != "" && (!attached || sleepIntent != sleepIntentIdle) {
+		return false
+	}
+	if attached {
+		return true
+	}
+	if eval.HasAssignedWork || explicitWake {
 		return true
 	}
 	// Routed demand wakes the canonical alias holder, for EVERY sleep class.
@@ -4348,9 +4355,8 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 			// Explicit sleep_intent always wins — if the session has
 			// signaled it wants to sleep, honor that regardless of demand.
 			template := normalizedSessionTemplateInfo(info, cfg)
-			hasExplicitSleepIntent := info.SleepIntent != ""
 			explicitWake := explicitWakePendingInfo(info)
-			demandOverrides := wakeDemandOverridesSleepSuppression(decision, eval, policy, poolDesired, template, hasExplicitSleepIntent, explicitWake)
+			demandOverrides := wakeDemandOverridesSleepSuppression(decision, eval, policy, poolDesired, template, info.SleepIntent, explicitWake)
 			if !demandOverrides {
 				eval.ConfigSuppressed = true
 				eval.Reasons = nil // Clear reasons so Phase 2 does not cancel the drain.
