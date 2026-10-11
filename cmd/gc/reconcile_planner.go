@@ -111,10 +111,10 @@ type bootState struct {
 func (b bootState) open() bool { return b.CachePrimed && b.InventoryComplete && b.RecordingSeen }
 
 // planner runs passes on one goroutine. Only that goroutine touches inflight,
-// backoff, bucket, fairSeed, boot, last, prevDuration, rowTrace, idleProbes,
-// memo and stalled; other goroutines reach the planner through markDirty,
-// the settlement queue, the execution-stalled inbox, the start pause and
-// stop, and read what a pass publishes through out.
+// backoff, bucket, fairSeed, boot, last, rowTrace, idleProbes, memo and
+// stalled; other goroutines reach the planner through markDirty, the
+// settlement queue, the execution-stalled inbox, the start pause and stop,
+// and read what a pass publishes through out.
 type planner struct {
 	clock       plannerClock
 	seam        txSeamFunc           // every pass's (effectPass.seam): stagingSeam's, or a test's
@@ -140,10 +140,7 @@ type planner struct {
 	fairSeed uint64 // admission's fair-share rotation (P4)
 	boot     bootState
 	last     passRecord
-	// prevDuration is the duration of the pass before last, zero before a
-	// second pass; paceGap paces on the shorter of the two.
-	prevDuration time.Duration
-	rowTrace     map[rowKey]string // each row's last traced (reason, outcome)
+	rowTrace map[rowKey]string // each row's last traced (reason, outcome)
 	// idleProbes are the idle begins submitted to prove an agent idle, by
 	// row, which paceIdleProbes holds a patrol apart.
 	idleProbes map[rowKey]idleProbe
@@ -282,19 +279,15 @@ func (p *planner) run(ctx context.Context) {
 }
 
 // paceGap is the wait from the last pass's start to an owed pass's
-// (CONTRACT v5.9j P1): plannerPaceFactor times the shorter of the last two
-// passes' durations (the last alone before a second pass), so one stretched
-// pass (a process pause, a stalled store read) does not scale it; at least
-// plannerMinGap, and at most the patrol's due time, one patrol after the
-// last pass ended, so an owed pass is never later than the patrol would
-// have run it, and slow passes still run at most half the time. A 101s
-// freeze once bought a 404s stall (staging J40 C).
+// (CONTRACT v5.9j P1): plannerPaceFactor times the last pass's duration,
+// at least plannerMinGap, and at most the patrol's due time, one patrol
+// after the last pass ended. So the idle time after a pass is at least
+// min(3 × its duration, the patrol): passes run at most a quarter of the
+// time, or d/(d+patrol) for a pass of d longer than a third of the patrol,
+// and an owed pass is never later than the patrol would have run it. A 101s
+// freeze once bought a 404s stall (staging J40 C); now at most a patrol.
 func (p *planner) paceGap() time.Duration {
-	pace := p.last.Duration
-	if p.prevDuration > 0 && p.prevDuration < pace {
-		pace = p.prevDuration
-	}
-	return max(plannerMinGap, min(plannerPaceFactor*pace, p.last.Duration+p.patrol()))
+	return max(plannerMinGap, min(plannerPaceFactor*p.last.Duration, p.last.Duration+p.patrol()))
 }
 
 // runPass applies the settlements posted since the last pass
@@ -312,7 +305,6 @@ func (p *planner) runPass(now time.Time) (res passResult) {
 				p.alert(alertPassPanic, "", fmt.Sprintf("pass panicked: %v", r))
 			}
 		}
-		p.prevDuration = p.last.Duration
 		p.last = passRecord{Start: now, Duration: p.clock.Now().Sub(now), Panicked: r != nil, Result: res}
 		p.metrics.recordPass(now, p.last.Duration, r != nil, res.Counts)
 		p.observePass(now)
